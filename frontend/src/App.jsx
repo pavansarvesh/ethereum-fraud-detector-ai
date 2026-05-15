@@ -242,22 +242,61 @@ export default function App() {
     } catch(e){setConnStatus('error');setMessage(e.message||'Unable to connect wallet.')}
   }
 
-  async function handleAnalyze(){
-    if(!sender)   {setMessage('Enter sender address or connect wallet.');return}
-    if(!recipient){setMessage('Enter a recipient address.');return}
-    if(!amount||parseFloat(amount)<=0){setMessage('Enter a valid amount > 0.');return}
-    setSending(true); setMessage('Analyzing with XGBoost model...')
+  async function analyzeTransaction(overrides = {}){
+    const txSender = overrides.sender ?? sender
+    const txReceiver = overrides.receiver ?? recipient
+    const txAmount = overrides.amount ?? amount
+    const txHash = overrides.tx_hash ?? `TX-${Date.now()}`
+    const txTimestamp = overrides.timestamp ?? Date.now()/1000
+
+    if(!txSender)   {setMessage('Enter sender address or connect wallet.');return}
+    if(!txReceiver) {setMessage('Enter a recipient address.');return}
+    if(!txAmount||parseFloat(txAmount)<=0){setMessage('Enter a valid amount > 0.');return}
+    setSending(true); setMessage('Analyzing wallet history with XGBoost & executing transfer if approved...')
     setReceiverRisk(null)
     try{
-      // ── Analyze sender transaction ─────────────────────────────────────────
+      if(overrides.seedHistory){
+        const seedRes = await fetch(`${API}/demo/seed_fraud_wallet`,{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({sender:txSender})
+        })
+        if(!seedRes.ok) throw new Error(`Unable to seed demo history (${seedRes.status})`)
+      }
+
+      // ── Analyze transaction & execute on backend ────────────────────────────
       const res=await fetch(`${API}/analyze_transaction`,{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({sender,receiver:recipient,amount:parseFloat(amount),
-          tx_hash:`TX-${Date.now()}`,timestamp:Date.now()/1000})
+        body:JSON.stringify({sender:txSender,receiver:txReceiver,amount:parseFloat(txAmount),
+          tx_hash:txHash,timestamp:txTimestamp})
       })
       if(!res.ok)throw new Error(`Server error ${res.status}`)
       const data=await res.json()
       setLastResult(data)
+
+      const blocked = data.action==='BLOCK'||data.action==='BLOCK_AND_BLACKLIST'
+      const frozen  = data.action==='FREEZE'
+      if(blocked||frozen){
+        setMessage(blocked?`❌ Transaction BLOCKED by AI — Fraud ${pct(data.fraud_probability)}. No ETH transferred.`:
+                         `⚠️ Transaction FROZEN — Review required. No ETH transferred.`)
+        setAlerts(p=>[{
+          text:`${data.action}: ${short(txSender)} → ${short(txReceiver)} | Score: ${pct(data.fraud_probability)} | Threshold: ${pct(data.threshold)} | Amount: ${data.amount} ETH`,
+          time:new Date().toLocaleTimeString(),type:blocked?'danger':'warn'
+        },...p.slice(0,19)])
+        if(walletAddr){
+          await fetchBalance(walletAddr, true)
+          if(txReceiver?.startsWith('0x') && txReceiver.length===42) await fetchBalance(txReceiver, true)
+        }
+        return data
+      }
+
+      const approved = data.transfer_executed
+
+      if(approved) {
+        const tr = data.transfer_result
+        setMessage(`✅ Transaction APPROVED & EXECUTED. Sender debited ${tr.amount_eth} ETH, receiver credited. Fraud score ${pct(data.fraud_probability)}.`)
+      } else {
+        setMessage(`✅ Transaction APPROVED by AI — Fraud ${pct(data.fraud_probability)}.`)
+      }
 
       // ── Track risk history for wallet risk score graph ─────────────────────
       setRiskHistory(prev=>{
@@ -277,8 +316,8 @@ export default function App() {
         const recvRes = await fetch(`${API}/analyze_transaction`,{
           method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({
-            sender   : recipient,
-            receiver : sender,
+            sender   : txReceiver,
+            receiver : txSender,
             amount   : 0.001,
             tx_hash  : `RECV-CHECK-${Date.now()}`,
             timestamp: Date.now()/1000,
@@ -300,29 +339,24 @@ export default function App() {
         }
       } catch(_){}
 
-      const blocked=data.action==='BLOCK'||data.action==='BLOCK_AND_BLACKLIST'
-      const frozen =data.action==='FREEZE'
-      setMessage(blocked?`Transaction BLOCKED — Fraud ${pct(data.fraud_probability)}`:
-                 frozen ?`Transaction FROZEN — Amount in high-risk zone`:
-                         `Transaction APPROVED — Fraud ${pct(data.fraud_probability)}`)
-      if(blocked||frozen){
-        setAlerts(p=>[{
-          text:`${data.action}: ${short(sender)} → ${short(recipient)} | Score: ${pct(data.fraud_probability)} | Threshold: ${pct(data.threshold)} | Amount: ${data.amount} ETH`,
-          time:new Date().toLocaleTimeString(),type:blocked?'danger':'warn'
-        },...p.slice(0,19)])
-        setScEvents(p=>[{
-          fn   :data.action==='BLOCK_AND_BLACKLIST'?'blockTransaction() + blacklistWallet()':
-                data.action==='FREEZE'?'freezeTransaction()':'blockTransaction()',
-          sender:short(sender),recv:short(recipient),
-          score:pct(data.fraud_probability),thresh:pct(data.threshold),
-          hash :data.tx_hash,block:data.block_number||'—',
-          amount:data.amount,time:new Date().toLocaleTimeString()
-        },...p.slice(0,9)])
-      }
+      setScEvents(p=>[{
+        fn   :data.action==='BLOCK_AND_BLACKLIST'?'blockTransaction() + blacklistWallet()':
+              data.action==='FREEZE'?'freezeTransaction()': data.action==='APPROVE_WITH_WARNING'?'approveTransactionWithWarning()':'approveTransaction()',
+        sender:short(txSender),recv:short(txReceiver),
+        score:pct(data.fraud_probability),thresh:pct(data.threshold),
+        hash :data.tx_hash,block:data.block_number||'—',
+        amount:data.amount,time:new Date().toLocaleTimeString()
+      },...p.slice(0,9)])
       if(walletAddr){
         await fetchBalance(walletAddr, true)
         setTimeout(()=>fetchBalance(walletAddr, true), 2000)
         setTimeout(()=>fetchWalletTxs(walletAddr), 1000)
+      }
+      if(txReceiver?.startsWith('0x') && txReceiver.length===42){
+        await fetchBalance(txReceiver, true)
+      }
+      if(txSender?.startsWith('0x') && txSender.length===42){
+        setTimeout(()=>fetchBalance(txSender, true), 1500)
       }
       await fetchData()
       setTimeout(()=>fetchData(), 1500)
@@ -334,6 +368,23 @@ export default function App() {
     }catch(e){
       setMessage(e.message?.includes('fetch')?'Backend not reachable. Run: python app.py':e.message)
     }finally{setSending(false)}
+  }
+
+  const handleAnalyze = () => analyzeTransaction()
+
+  async function runFraudDemo(){
+    const demoSender = walletAddr || '0x1111111111111111111111111111111111111111'
+    const demoReceiver = '0x2222222222222222222222222222222222222222'
+    setSender(demoSender)
+    setRecipient(demoReceiver)
+    setAmount('2.5')
+    await analyzeTransaction({
+      sender: demoSender,
+      receiver: demoReceiver,
+      amount: 2.5,
+      tx_hash: `DEMO-${Date.now()}`,
+      seedHistory: true,
+    })
   }
 
   // ── PDF Export ──────────────────────────────────────────────────────────────
@@ -424,10 +475,10 @@ export default function App() {
   // Amount rule helper for UI preview
   function getAmountRule(a){
     const v=parseFloat(a||0)
-    if(v<=0.00001)return{label:'BLOCK',color:'#ef4444',desc:'Dust/zero TX'}
-    if(v<=25)     return{label:'SAFE',color:'#22c55e',desc:'Safe range'}
-    if(v<=50)     return{label:'FREEZE',color:'#f59e0b',desc:'Freeze zone'}
-    return              {label:'BLOCK',color:'#ef4444',desc:'Auto-block'}
+    if(v<=0.00001)return{label:'LOW',color:'#22c55e',desc:'Small transfer'}
+    if(v<=25)     return{label:'NORMAL',color:'#22c55e',desc:'Model decides from wallet history'}
+    if(v<=50)     return{label:'ELEVATED',color:'#f59e0b',desc:'Model will still score by behavior history'}
+    return              {label:'ELEVATED',color:'#f59e0b',desc:'Amount is not the decision rule'}
   }
 
   const safeCount  = stats?(stats.total_transactions-stats.fraud_detected):0
@@ -466,19 +517,16 @@ export default function App() {
           ))}
         </div>
         <div className="nav-right">
-          <span className={`net-badge ${chainLive?'live':''}`}><span className="status-dot connected-dot"/>{chainLive?'Blockchain Live':'Offline'}</span>
           {walletAddr
-            ?<div className="wallet-info-pill">
-                <span className="wallet-network">{network}</span>
-                <span className="wallet-bal">
-                  {balance} ETH
-                  {balanceDiff&&<span className={`bal-diff ${parseFloat(balanceDiff)>0?'pos':'neg'}`}>
-                    {parseFloat(balanceDiff)>0?'+':''}{balanceDiff}
-                  </span>}
-                </span>
-                <span className="wallet-addr">{compactAddr}</span>
+            ?<div className="wallet-badge">
+                <div className="wallet-badge-net">{network}</div>
+                <div className="wallet-badge-main">
+                  <div className="wallet-badge-amount"><span className="amt">{balance}</span><span className="sym">Ξ</span></div>
+                  <div className="wallet-badge-addr">{compactAddr}</div>
+                </div>
               </div>
-            :<span className="address-chip-nav" onClick={handleConnect}>Connect Wallet</span>}
+            :<span className="wallet-connect-btn" onClick={handleConnect}>Connect Wallet</span>}
+          <span className={`status-pulse ${chainLive?'live':''}`}><span className="pulse-dot"/></span>
         </div>
       </nav>
 
@@ -491,21 +539,21 @@ export default function App() {
               <div className={`status-badge ${connStatus}`}><span className="status-dot"/>{statusLabel}{walletAddr&&<span style={{marginLeft:8,fontSize:10,opacity:.7}}>| {network} | {balance} ETH</span>}</div>
               <p className="eyebrow">Ethereum AI Fraud Detection</p>
               <h1>Detect phishing wallets with real-time AI analysis.</h1>
-              <p className="hero-copy">XGBoost trained on 2.97M Ethereum wallets. Amount rules: 0–25 ETH Safe · 26–50 ETH Freeze · 50+ ETH Block. Dynamic thresholds adapt per wallet.</p>
+              <p className="hero-copy">XGBoost trained on Ethereum wallet behavior. The model scores wallet history, counterparties, activity timing, and transfer patterns. No fixed freeze/block amount bands.</p>
               <div className="hero-actions">
                 <button className="primary-button" onClick={handleConnect} disabled={connStatus==='connecting'}>{connStatus==='connected'?'Reconnect wallet':connStatus==='connecting'?'Connecting...':'Connect MetaMask'}</button>
                 <div className="address-chip">{compactAddr}</div>
               </div>
             </section>
 
-            {/* Amount rule legend */}
+            {/* AI history legend */}
             <div className="amount-rules-bar">
-              <span className="rule-item safe">0–25 ETH: SAFE</span>
+              <span className="rule-item safe">History patterns</span>
               <span className="rule-arrow">→</span>
-              <span className="rule-item freeze">26–50 ETH: FREEZE</span>
+              <span className="rule-item freeze">AI model score</span>
               <span className="rule-arrow">→</span>
-              <span className="rule-item block">50+ ETH: BLOCK</span>
-              <span className="rule-note">+ Dynamic threshold adapts per wallet history</span>
+              <span className="rule-item block">Decision from wallet behavior</span>
+              <span className="rule-note">Model inputs are built from sender history during the transaction</span>
             </div>
 
             <section className="panel-grid">
@@ -624,7 +672,7 @@ export default function App() {
               <div className={`status-badge ${connStatus}`}><span className="status-dot"/>{statusLabel}</div>
               <p className="eyebrow">AI-Powered Transaction Analysis</p>
               <h1>Submit a transaction to detect phishing.</h1>
-              <p className="hero-copy">XGBoost trained on 2.97M wallets. Rules: 0–25 ETH Safe · 26–50 ETH Freeze · 50+ ETH Block. Dynamic threshold adapts per wallet behavior.</p>
+              <p className="hero-copy">XGBoost scores the wallet’s transaction history and the current transfer features. The model does not depend on fixed amount bands.</p>
               <div className="hero-actions">
                 <button className="primary-button" onClick={handleConnect} disabled={connStatus==='connecting'}>{connStatus==='connected'?'Reconnect wallet':'Connect MetaMask'}</button>
                 <div className="address-chip">{compactAddr}</div>
@@ -723,13 +771,18 @@ export default function App() {
                   <p className="message-text">{message}</p>
                 </div>
                 <div style={{marginTop:20}}>
-                  <p className="eyebrow muted" style={{marginBottom:10}}>Quick Test Scenarios</p>
+                  <p className="eyebrow muted" style={{marginBottom:10}}>AI Demo Flow</p>
+                  <button className="scenario-btn" onClick={runFraudDemo} style={{borderColor:'#ef444455'}}>
+                    <span>Seed suspicious wallet history and analyze fraud</span>
+                    <span style={{color:'#ef4444'}} className="mono">RUN DEMO</span>
+                  </button>
+                  <button className="scenario-btn" onClick={()=>loadScenario(walletAddr||'0xAAA...001','0xBBB...001',0.5)}>
+                    <span>Normal baseline transaction</span>
+                    <span style={{color:'#22c55e'}} className="mono">AI SCORE</span>
+                  </button>
                   {[
-                    ['Normal — 0.5 ETH (Safe range)',        walletAddr||'0xAAA...001','0xBBB...001', 0.5 ],
-                    ['Medium — 5 ETH (Safe range)',          walletAddr||'0xAAA...001','0xBBB...001', 5.0 ],
-                    ['Freeze zone — 35 ETH (26–50)',         walletAddr||'0xAAA...001','0xBBB...001',35.0 ],
-                    ['Auto-block — 75 ETH (50+)',            walletAddr||'0xAAA...001','0xBBB...001',75.0 ],
-                    ['Build history then spike — 0.1 ETH',  walletAddr||'0xAAA...001','0xBBB...001', 0.1 ],
+                    ['Suspicious history tx — 2.5 ETH',      walletAddr||'0xAAA...001','0xBBB...001', 2.5 ],
+                    ['Clean wallet tx — 0.5 ETH',           walletAddr||'0xAAA...001','0xBBB...001', 0.5 ],
                   ].map(([label,s,r,a])=>(
                     <button key={label} className="scenario-btn" onClick={()=>loadScenario(s,r,a)}>
                       <span>{label}</span>
