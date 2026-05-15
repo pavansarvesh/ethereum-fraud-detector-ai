@@ -107,7 +107,7 @@ def get_web3() -> Web3:
         if geth_poa_middleware:
             try: _w3.middleware_onion.inject(geth_poa_middleware, layer=0)
             except Exception: pass
-        print(f"[BLOCKCHAIN] {'Connected' if _w3.is_connected() else 'FAILED'} → {BLOCKCHAIN_RPC}")
+        print(f"[BLOCKCHAIN] {'Connected' if _w3.is_connected() else 'FAILED'} -> {BLOCKCHAIN_RPC}")
     return _w3
 
 def get_contract():
@@ -116,9 +116,15 @@ def get_contract():
     w3 = get_web3()
     if w3 and w3.is_connected() and CONTRACT_ADDRESS:
         try:
+            # Prefer compiled ABI from deploy (full, 29 entries)
+            abi = CONTRACT_ABI
+            abi_path = os.path.join(os.path.dirname(__file__), 'abi.json')
+            if os.path.exists(abi_path):
+                with open(abi_path) as f:
+                    abi = json.load(f)
             _contract = w3.eth.contract(
                 address=Web3.to_checksum_address(CONTRACT_ADDRESS),
-                abi=CONTRACT_ABI
+                abi=abi
             )
             print(f"[BLOCKCHAIN] Contract loaded at {CONTRACT_ADDRESS}")
         except Exception as e:
@@ -130,18 +136,36 @@ def is_connected() -> bool:
     except: return False
 
 def _send_tx(fn_call) -> dict:
-    """Build, sign, and send a contract transaction."""
-    w3     = get_web3()
-    admin  = w3.eth.account.from_key(ADMIN_PRIVATE_KEY)
-    nonce  = w3.eth.get_transaction_count(admin.address)
-    tx     = fn_call.build_transaction({
-        "from": admin.address, "nonce": nonce,
-        "gas": 500000, "gasPrice": w3.eth.gas_price,
-    })
-    signed  = w3.eth.account.sign_transaction(tx, ADMIN_PRIVATE_KEY)
-    receipt = w3.eth.wait_for_transaction_receipt(
-        w3.eth.send_raw_transaction(signed.rawTransaction)
-    )
+    """Build, sign, and send a contract transaction.
+    Supports two modes:
+      1. Private key mode: signs with ADMIN_PRIVATE_KEY
+      2. Ganache unlocked mode: sends directly (Ganache auto-signs)
+    """
+    w3 = get_web3()
+
+    if ADMIN_PRIVATE_KEY:
+        # Mode 1: Signed transaction (production / Sepolia)
+        admin  = w3.eth.account.from_key(ADMIN_PRIVATE_KEY)
+        nonce  = w3.eth.get_transaction_count(admin.address)
+        tx     = fn_call.build_transaction({
+            "from": admin.address, "nonce": nonce,
+            "gas": 500000, "gasPrice": w3.eth.gas_price,
+        })
+        signed  = w3.eth.account.sign_transaction(tx, ADMIN_PRIVATE_KEY)
+        receipt = w3.eth.wait_for_transaction_receipt(
+            w3.eth.send_raw_transaction(signed.rawTransaction)
+        )
+    else:
+        # Mode 2: Ganache unlocked accounts (no private key needed)
+        deployer = w3.eth.accounts[0]
+        nonce    = w3.eth.get_transaction_count(deployer)
+        tx       = fn_call.build_transaction({
+            "from": deployer, "nonce": nonce,
+            "gas": 500000, "gasPrice": w3.eth.gas_price,
+        })
+        tx_hash  = w3.eth.send_transaction(tx)
+        receipt  = w3.eth.wait_for_transaction_receipt(tx_hash)
+
     return {
         "success"         : receipt.status == 1,
         "blockchain_hash" : receipt.transactionHash.hex(),
@@ -167,7 +191,7 @@ def log_transaction_on_chain(tx_hash, sender, receiver, amount_eth,
     w3       = get_web3()
     contract = get_contract()
 
-    if w3 and w3.is_connected() and contract and ADMIN_PRIVATE_KEY:
+    if w3 and w3.is_connected() and contract:
         try:
             s_addr = Web3.to_checksum_address(sender)   if len(str(sender))==42   else w3.eth.accounts[0]
             r_addr = Web3.to_checksum_address(receiver) if len(str(receiver))==42 else w3.eth.accounts[0]
@@ -194,7 +218,7 @@ def anchor_threshold_on_chain(wallet_address: str, threshold: float,
     w3       = get_web3()
     contract = get_contract()
 
-    if w3 and w3.is_connected() and contract and ADMIN_PRIVATE_KEY:
+    if w3 and w3.is_connected() and contract:
         try:
             w_addr = Web3.to_checksum_address(wallet_address) if len(str(wallet_address))==42 else w3.eth.accounts[0]
             return _send_tx(contract.functions.updateWalletThreshold(
@@ -266,12 +290,12 @@ def register_model_hash(model_path: str, version: str = "v1.0") -> dict:
     w3       = get_web3()
     contract = get_contract()
 
-    if w3 and w3.is_connected() and contract and ADMIN_PRIVATE_KEY:
+    if w3 and w3.is_connected() and contract:
         try:
             result = _send_tx(contract.functions.registerModelHash(bytes32_hash, version))
             result["model_hash"] = f"0x{hex_hash}"
             result["version"]    = version
-            print(f"[BLOCKCHAIN] Model hash registered on-chain ✓")
+            print(f"[BLOCKCHAIN] Model hash registered on-chain (OK)")
             return result
         except Exception as e:
             print(f"[BLOCKCHAIN] registerModelHash error: {e}")

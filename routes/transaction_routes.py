@@ -23,7 +23,7 @@ from blockchain.connect        import (log_transaction_on_chain,
                                        get_threshold_history_from_chain,
                                        verify_model_integrity)
 from database.db               import (
-    save_transaction, get_sender_history,
+    save_transaction, get_sender_history, get_receiver_history,
     get_all_transactions, get_dashboard_stats,
     blacklist_wallet, is_blacklisted,
     get_blacklisted_wallets, remove_blacklist,
@@ -38,12 +38,13 @@ transaction_bp = Blueprint('transactions', __name__)
 # ── POST /analyze_transaction ──────────────────────────────────────────────────
 @transaction_bp.route('/analyze_transaction', methods=['POST'])
 def analyze_transaction():
-    data      = request.json or {}
-    sender    = data.get('sender',   'unknown')
-    receiver  = data.get('receiver', 'unknown')
-    amount    = float(data.get('amount', 0))
-    tx_hash   = data.get('tx_hash', f'TX-{uuid.uuid4().hex[:12].upper()}')
-    timestamp = data.get('timestamp', datetime.now().timestamp())
+    data       = request.json or {}
+    sender     = data.get('sender',   'unknown')
+    receiver   = data.get('receiver', 'unknown')
+    amount     = float(data.get('amount', 0))
+    tx_hash    = data.get('tx_hash', f'TX-{uuid.uuid4().hex[:12].upper()}')
+    timestamp  = data.get('timestamp', datetime.now().timestamp())
+    check_only = data.get('check_only', False)  # If True, skip DB/blockchain persistence
 
     # ── Blacklist check ────────────────────────────────────────────────────────
     if is_blacklisted(sender):
@@ -53,15 +54,17 @@ def analyze_transaction():
             'All transactions from blacklisted wallets are permanently blocked',
         ]
         result = _build_blocked_result(tx_hash, sender, receiver, amount, explanation)
-        save_transaction({**result, 'failed': 1})
-        _save_alert_and_event(result, sender, receiver)
+        if not check_only:
+            save_transaction({**result, 'failed': 1})
+            _save_alert_and_event(result, sender, receiver)
         return jsonify(result), 200
 
     # ── Feature engineering ────────────────────────────────────────────────────
-    sender_history = get_sender_history(sender, limit=200)
-    features       = engineer_features(
+    sender_history   = get_sender_history(sender, limit=200)
+    receiver_history = get_receiver_history(sender, limit=200)
+    features         = engineer_features(
         {'amount': amount, 'receiver': receiver, 'timestamp': timestamp},
-        sender_history
+        sender_history, receiver_history
     )
 
     # ── AI prediction ──────────────────────────────────────────────────────────
@@ -84,24 +87,25 @@ def analyze_transaction():
         features, fraud_prob, threshold, decision, thresh_data, amount
     )
 
-    # ── Blockchain log ─────────────────────────────────────────────────────────
-    bc = log_transaction_on_chain(
-        tx_hash, sender, receiver, amount,
-        fraud_prob, threshold, decision, action
-    )
+    # ── Blockchain log (skip for check_only) ───────────────────────────────────
+    bc = {'blockchain_hash': '', 'block_number': 0, 'simulated': True}
+    if not check_only:
+        bc = log_transaction_on_chain(
+            tx_hash, sender, receiver, amount,
+            fraud_prob, threshold, decision, action
+        )
 
-    # ── Phase 2: Anchor threshold on-chain ────────────────────────────────────
-    # This makes threshold evolution tamper-proof and verifiable by anyone
-    try:
-        anchor_threshold_on_chain(sender, threshold, fraud_prob, amount)
-    except Exception as e:
-        print(f"[PHASE2] Threshold anchor error: {e}")
+        # ── Phase 2: Anchor threshold on-chain ────────────────────────────────
+        try:
+            anchor_threshold_on_chain(sender, threshold, fraud_prob, amount)
+        except Exception as e:
+            print(f"[PHASE2] Threshold anchor error: {e}")
 
-    # ── Auto-blacklist ─────────────────────────────────────────────────────────
-    if action == 'BLOCK_AND_BLACKLIST':
-        blacklist_wallet(sender, f'Auto-blacklisted: fraud {fraud_prob:.2%}')
+        # ── Auto-blacklist ─────────────────────────────────────────────────────
+        if action == 'BLOCK_AND_BLACKLIST':
+            blacklist_wallet(sender, f'Auto-blacklisted: fraud {fraud_prob:.2%}')
 
-    # ── Save to DB ─────────────────────────────────────────────────────────────
+    # ── Save to DB (skip for check_only) ───────────────────────────────────────
     tx_record = {
         'tx_hash'          : tx_hash,
         'sender'           : sender,
@@ -115,12 +119,12 @@ def analyze_transaction():
         'action'           : action,
         'blockchain_hash'  : bc.get('blockchain_hash', ''),
         'block_number'     : bc.get('block_number', 0),
+        'gas_used'         : bc.get('gas_used', 0),
         'failed'           : 1 if action in ('BLOCK','BLOCK_AND_BLACKLIST','FREEZE') else 0,
     }
-    save_transaction(tx_record)
-
-    # ── Persist alert + SC event if blocked/frozen ─────────────────────────────
-    _save_alert_and_event(tx_record, sender, receiver)
+    if not check_only:
+        save_transaction(tx_record)
+        _save_alert_and_event(tx_record, sender, receiver)
 
     return jsonify({
         **tx_record,
@@ -142,7 +146,7 @@ def _save_alert_and_event(tx: dict, sender: str, receiver: str):
     action = tx.get('action', '')
     if action in ('BLOCK', 'BLOCK_AND_BLACKLIST', 'FREEZE'):
         alert_text = (
-            f"{action}: {sender[:10]}...→{receiver[:10]}... | "
+            f"{action}: {sender[:10]}...->{receiver[:10]}... | "
             f"Score: {tx.get('fraud_probability',0)*100:.1f}% | "
             f"Threshold: {tx.get('threshold',0)*100:.1f}% | "
             f"Amount: {tx.get('amount',0)} ETH"
@@ -237,7 +241,10 @@ def remove_from_blacklist(address):
 @transaction_bp.route('/blacklist',         methods=['POST'])
 def add_to_blacklist():
     data = request.json or {}
-    blacklist_wallet(data.get('address',''), data.get('reason','Manual blacklist'))
+    address = data.get('address', '').strip()
+    if not address or len(address) != 42 or not address.startswith('0x'):
+        return jsonify({'error': 'Invalid Ethereum address. Must be 42 chars starting with 0x.'}), 400
+    blacklist_wallet(address, data.get('reason','Manual blacklist'))
     return jsonify({'status': 'ok'})
 
 

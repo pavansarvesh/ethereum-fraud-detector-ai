@@ -2,11 +2,12 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import './App.css'
 
-const API         = 'http://127.0.0.1:5000'
-const GANACHE_RPC = 'http://127.0.0.1:7545'
+const API         = import.meta.env.VITE_API_URL || 'http://127.0.0.1:5000'
+const GANACHE_RPC = import.meta.env.VITE_GANACHE_RPC || 'http://127.0.0.1:7545'
 const short  = (s='') => s.length>14?`${s.slice(0,6)}...${s.slice(-4)}`:s
 const pct    = n=>`${(parseFloat(n||0)*100).toFixed(1)}%`
 const fmtEth = n=>parseFloat(n||0).toFixed(4)
+const esc    = s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
 
 export default function App() {
   const [tab,          setTab         ] = useState('overview')
@@ -40,6 +41,8 @@ export default function App() {
   const [verifyResult, setVerifyResult ] = useState(null)
   const [chainThreshHistory, setChainThreshHistory] = useState([])  // Phase 5
   const [modelIntegrity,     setModelIntegrity    ] = useState(null) // Phase 3
+  const [verifyHash,         setVerifyHash        ] = useState('')
+  const ethListenersRef = useRef(false)
 
   const fetchData = useCallback(async () => {
     try {
@@ -228,11 +231,14 @@ export default function App() {
       fetchChainThresholdHistory(addr)
       setConnStatus('connected')
       setMessage('Wallet connected. Ready to analyze transactions.')
-      window.ethereum.on('accountsChanged',accs=>{
-        if(!accs.length){setConnStatus('disconnected');setWalletAddr(null);setBalance('0.0000');setWalletTxList([])}
-        else{setWalletAddr(accs[0]);setSender(accs[0]);fetchBalance(accs[0]);fetchWalletTxs(accs[0])}
-      })
-      window.ethereum.on('chainChanged', ()=> window.location.reload())
+      if(!ethListenersRef.current){
+        window.ethereum.on('accountsChanged',accs=>{
+          if(!accs.length){setConnStatus('disconnected');setWalletAddr(null);setBalance('0.0000');setWalletTxList([])}
+          else{setWalletAddr(accs[0]);setSender(accs[0]);fetchBalance(accs[0]);fetchWalletTxs(accs[0])}
+        })
+        window.ethereum.on('chainChanged', ()=> window.location.reload())
+        ethListenersRef.current=true
+      }
     } catch(e){setConnStatus('error');setMessage(e.message||'Unable to connect wallet.')}
   }
 
@@ -275,7 +281,8 @@ export default function App() {
             receiver : sender,
             amount   : 0.001,
             tx_hash  : `RECV-CHECK-${Date.now()}`,
-            timestamp: Date.now()/1000
+            timestamp: Date.now()/1000,
+            check_only: true
           })
         })
         if(recvRes.ok){
@@ -373,13 +380,13 @@ export default function App() {
       <div class="section">
         <h3>Transaction Details</h3>
         <table><tbody>
-          <tr><td>Transaction ID</td><td class="val">${result.tx_hash}</td></tr>
-          <tr><td>Sender Address</td><td class="val">${result.sender}</td></tr>
-          <tr><td>Receiver Address</td><td class="val">${result.receiver}</td></tr>
-          <tr><td>Amount</td><td class="val">${result.amount} ETH</td></tr>
-          <tr><td>Timestamp</td><td class="val">${result.timestamp||new Date().toISOString()}</td></tr>
-          <tr><td>Blockchain Hash</td><td class="val">${result.blockchain_hash||'Simulated'}</td></tr>
-          <tr><td>Block Number</td><td class="val">${result.block_number||'Pending'}</td></tr>
+          <tr><td>Transaction ID</td><td class="val">${esc(result.tx_hash)}</td></tr>
+          <tr><td>Sender Address</td><td class="val">${esc(result.sender)}</td></tr>
+          <tr><td>Receiver Address</td><td class="val">${esc(result.receiver)}</td></tr>
+          <tr><td>Amount</td><td class="val">${esc(result.amount)} ETH</td></tr>
+          <tr><td>Timestamp</td><td class="val">${esc(result.timestamp||new Date().toISOString())}</td></tr>
+          <tr><td>Blockchain Hash</td><td class="val">${esc(result.blockchain_hash||'Simulated')}</td></tr>
+          <tr><td>Block Number</td><td class="val">${esc(result.block_number||'Pending')}</td></tr>
         </tbody></table>
       </div>
       <div class="section">
@@ -452,9 +459,9 @@ export default function App() {
           ETH FRAUD SHIELD
         </div>
         <div className="nav-tabs">
-          {['overview','analyze','blockchain','alerts'].map(t=>(
+          {['overview','transaction','blockchain','alerts'].map(t=>(
             <button key={t} className={`nav-tab ${tab===t?'active':''}`} onClick={()=>setTab(t)}>
-              {t==='alerts'&&alerts.length>0?<>{t.charAt(0).toUpperCase()+t.slice(1)}<span className="alert-dot">{alerts.length}</span></>:t.charAt(0).toUpperCase()+t.slice(1)}
+              {t==='alerts'&&alerts.length>0?<>{t.charAt(0).toUpperCase()+t.slice(1)} <span className="alert-dot">{alerts.length}</span></>:t.charAt(0).toUpperCase()+t.slice(1)}
             </button>
           ))}
         </div>
@@ -611,7 +618,7 @@ export default function App() {
         )}
 
         {/* ═══════ ANALYZE ═══════ */}
-        {tab==='analyze'&&(
+        {tab==='transaction'&&(
           <div className="wallet-dashboard">
             <section className="hero-card">
               <div className={`status-badge ${connStatus}`}><span className="status-dot"/>{statusLabel}</div>
@@ -1249,9 +1256,9 @@ export default function App() {
             <section className="send-panel">
               <div className="panel-header"><div><p className="eyebrow muted">On-chain Verification</p><h2>Transaction Receipt Verifier</h2></div></div>
               <div style={{display:'flex',gap:10,marginBottom:16}}>
-                <input id="verifyInput" className="form-input" placeholder="Enter blockchain hash to verify on Ganache..." style={{flex:1}}/>
+                <input className="form-input" placeholder="Enter blockchain hash to verify on Ganache..." style={{flex:1}} value={verifyHash} onChange={e=>setVerifyHash(e.target.value)}/>
                 <button className="primary-button" style={{whiteSpace:'nowrap'}} onClick={async()=>{
-                  const hash=document.getElementById('verifyInput').value.trim()
+                  const hash=verifyHash.trim()
                   if(!hash){return}
                   try{const res=await fetch(`${API}/verify/${hash}`);const d=await res.json();setVerifyResult(d)}catch(_){setVerifyResult({verified:false,message:'Backend not reachable'})}
                 }}>Verify</button>

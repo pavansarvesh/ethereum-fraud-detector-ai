@@ -5,6 +5,14 @@ app.py — Phase 3 + 4
 """
 
 import os
+
+# Load .env file automatically
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -59,7 +67,7 @@ def register_model_on_startup():
         # First verify if already registered
         integrity = verify_model_integrity(model_path)
         if integrity.get("verified") and not integrity.get("simulated"):
-            print(f"[SECURITY] Model hash verified on-chain ✓ Status: {integrity['status']}")
+            print(f"[SECURITY] Model hash verified on-chain (OK) Status: {integrity['status']}")
             return
 
         # Register new hash

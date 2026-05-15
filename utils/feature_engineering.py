@@ -11,7 +11,7 @@ from datetime import datetime
 import math
 
 
-def engineer_features(raw: dict, sender_history: list) -> dict:
+def engineer_features(raw: dict, sender_history: list, receiver_history: list = None) -> dict:
     amount   = float(raw.get('amount', 0))
     receiver = raw.get('receiver', '')
 
@@ -42,20 +42,26 @@ def engineer_features(raw: dict, sender_history: list) -> dict:
     all_receivers    = list(set(hist_receivers + [receiver]))
     sent_unique_recv = len(all_receivers)
 
-    # ── Received features (approximated from history) ─────────────────────────
-    # Transactions where wallet was approved as safe = received funds
-    recv_txs         = [h for h in sender_history if h.get('decision') == 'SAFE']
+    # ── Received features ─────────────────────────────────────────────────────
+    if receiver_history:
+        # Use actual received transactions (wallet appeared as receiver)
+        recv_txs = receiver_history
+    else:
+        # Fallback: approximate from SAFE decisions in sender history
+        recv_txs = [h for h in sender_history if h.get('decision') == 'SAFE']
+
     recv_count       = len(recv_txs)
     recv_amounts     = [h['amount'] for h in recv_txs if h.get('amount', 0) > 0]
     recv_total       = sum(recv_amounts) if recv_amounts else 0.0
     recv_mean        = recv_total / len(recv_amounts) if recv_amounts else 0.0
     recv_max         = max(recv_amounts) if recv_amounts else 0.0
-    recv_unique_send = len({h.get('receiver', '') for h in recv_txs})
+    recv_unique_send = len({h.get('sender', h.get('receiver', '')) for h in recv_txs})
 
     # ── Temporal features ─────────────────────────────────────────────────────
     all_hours        = hist_hours + [hour]
     sent_active_span = float(max(all_hours) - min(all_hours)) if len(all_hours) > 1 else 0.0
-    recv_active_span = 0.0
+    recv_hours       = [h.get('hour', 12) for h in recv_txs]
+    recv_active_span = float(max(recv_hours) - min(recv_hours)) if len(recv_hours) > 1 else 0.0
 
     # ── Night transaction features ────────────────────────────────────────────
     night_sent_count = sum(1 for h in sender_history if h.get('hour', 12) < 6 or h.get('hour', 12) > 22)
@@ -64,7 +70,7 @@ def engineer_features(raw: dict, sender_history: list) -> dict:
 
     # ── Derived features ──────────────────────────────────────────────────────
     total_tx_count      = sent_count + recv_count
-    sent_recv_ratio     = sent_count / max(recv_count + 1, 1)
+    sent_recv_ratio     = sent_count / max(recv_count, 1)
     unique_counterparts = sent_unique_recv + recv_unique_send
     large_tx_flag       = 1 if sent_max > 10 else 0
     zero_recv_flag      = 1 if recv_count == 0 else 0
