@@ -1,85 +1,98 @@
 """
-DYNAMIC THRESHOLD + DECISION ENGINE
-Rules:
-  0.00001 – 25 ETH  → SAFE   (default)
-  26 – 50 ETH       → FREEZE
-  50+ ETH           → BLOCK
-These are defaults. Per-wallet history overrides them dynamically.
+Dynamic threshold + confirmation engine.
+The score is derived from wallet history, not fixed amount bands.
 """
 
 import math
-from database.db import get_sender_history
-
-# ── Default amount-based rules ────────────────────────────────────────────────
-def get_amount_based_rule(amount: float) -> dict:
-    if amount <= 0.00001:
-        return {'action': 'BLOCK',  'reason': 'Zero or dust transaction — suspicious', 'base_threshold': 0.30}
-    elif amount <= 25.0:
-        return {'action': 'SAFE',   'reason': 'Amount within safe range (0–25 ETH)',   'base_threshold': 0.70}
-    elif amount <= 50.0:
-        return {'action': 'FREEZE', 'reason': 'Amount in freeze range (26–50 ETH)',    'base_threshold': 0.50}
-    else:
-        return {'action': 'BLOCK',  'reason': 'Amount exceeds 50 ETH — auto-block',   'base_threshold': 0.30}
+from database.db import get_wallet_history
 
 
-def calculate_dynamic_threshold(sender_address: str, current_amount: float) -> dict:
-    history     = get_sender_history(sender_address, limit=200)
-    amount_rule = get_amount_based_rule(current_amount)
-    base_thresh = amount_rule['base_threshold']
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
-    # ── No history ────────────────────────────────────────────────────────────
+
+def _counterparty_count(history: list, wallet_address: str) -> int:
+    wallet = (wallet_address or '').lower()
+    counterparties = set()
+    for entry in history:
+        sender = (entry.get('sender') or '').lower()
+        receiver = (entry.get('receiver') or '').lower()
+        if sender and sender != wallet:
+            counterparties.add(sender)
+        if receiver and receiver != wallet:
+            counterparties.add(receiver)
+    return len(counterparties)
+
+
+def calculate_dynamic_threshold(wallet_address: str, current_amount: float) -> dict:
+    history = get_wallet_history(wallet_address, limit=200)
+
     if not history:
-        risk = 'high' if current_amount > 50 else 'medium' if current_amount > 25 else 'low'
         return {
-            'threshold'        : round(base_thresh, 4),
-            'risk_level'       : risk,
-            'reason'           : f"New wallet — {amount_rule['reason']}",
+            'threshold'        : 0.55,
+            'risk_level'       : 'medium',
+            'reason'           : 'New wallet — threshold anchored from first observed behavior',
             'avg_amount'       : 0.0,
             'std_dev'          : 0.0,
-            'amount_deviation' : current_amount,
+            'amount_deviation' : 0.0,
             'tx_count'         : 0,
-            'amount_rule'      : amount_rule['action'],
+            'counterparties'   : 0,
+            'failed_ratio'     : 0.0,
         }
 
-    # ── Existing wallet ───────────────────────────────────────────────────────
-    amounts      = [h['amount'] for h in history if h.get('amount', 0) > 0]
-    failed_flags = [h.get('failed', 0) for h in history]
-
+    amounts = [float(h.get('amount', 0) or 0) for h in history if float(h.get('amount', 0) or 0) > 0]
     if not amounts:
-        amounts = [current_amount]
+        amounts = [float(current_amount or 0)]
 
-    tx_count     = len(amounts)
-    avg_amount   = sum(amounts) / tx_count
-    variance     = sum((a - avg_amount)**2 for a in amounts) / tx_count
-    std_dev      = math.sqrt(variance) if variance > 0 else avg_amount * 0.5
-    failed_ratio = sum(failed_flags) / max(len(failed_flags), 1)
+    tx_count = len(history)
+    avg_amount = sum(amounts) / len(amounts)
+    variance = sum((a - avg_amount) ** 2 for a in amounts) / len(amounts)
+    std_dev = math.sqrt(variance) if variance > 0 else max(avg_amount * 0.25, 0.01)
+    failed_ratio = sum(1 for h in history if int(h.get('failed', 0) or 0) > 0) / max(tx_count, 1)
+    counterparties = _counterparty_count(history, wallet_address)
+    z_score = abs(float(current_amount or 0) - avg_amount) / max(std_dev, 0.01)
+    concentration = counterparties / max(tx_count, 1)
 
-    # Z-score deviation
-    z_score = (current_amount - avg_amount) / max(std_dev, 0.01)
-
-    # Risk classification
     score = 0
-    if avg_amount > 10:    score += 2
-    elif avg_amount > 3:   score += 1
-    if tx_count < 3:       score += 1
-    if tx_count > 500:     score += 1
-    if failed_ratio > 0.3: score += 2
-    elif failed_ratio > 0.1: score += 1
-    risk_level = 'high' if score >= 4 else 'medium' if score >= 2 else 'low'
+    if tx_count < 3:
+        score += 2
+    elif tx_count < 10:
+        score += 1
 
-    # Start from amount-based threshold, then tighten by deviation
-    threshold = base_thresh
-    if z_score > 5:
-        threshold = max(threshold - 0.20, 0.25)
-        reason = f"Amount {current_amount:.2f} ETH is {z_score:.1f}σ above wallet avg {avg_amount:.2f} ETH — critically tightened"
-    elif z_score > 3:
-        threshold = max(threshold - 0.12, 0.30)
-        reason = f"Amount {current_amount:.2f} ETH is {z_score:.1f}σ above wallet avg {avg_amount:.2f} ETH — tightened"
+    if failed_ratio > 0.30:
+        score += 2
+    elif failed_ratio > 0.10:
+        score += 1
+
+    if z_score > 4:
+        score += 2
     elif z_score > 2:
-        threshold = max(threshold - 0.07, 0.35)
-        reason = f"Amount moderately elevated ({z_score:.1f}σ above avg {avg_amount:.2f} ETH)"
+        score += 1
+
+    if concentration > 0.75 and tx_count > 8:
+        score += 1
+    if concentration < 0.20 and tx_count > 20:
+        score += 1
+
+    if avg_amount > 0 and float(current_amount or 0) > avg_amount * 3:
+        score += 1
+
+    risk_level = 'high' if score >= 5 else 'medium' if score >= 2 else 'low'
+
+    threshold = 0.70 - (score * 0.05)
+    if risk_level == 'high':
+        threshold -= min(max(z_score - 1.5, 0) * 0.02, 0.10)
+    elif risk_level == 'low':
+        threshold += 0.04
+
+    threshold = _clamp(threshold, 0.30, 0.85)
+
+    if risk_level == 'high':
+        reason = f"Wallet behavior is high-risk: {tx_count} txs, {failed_ratio*100:.1f}% failed, {counterparties} counterparties"
+    elif risk_level == 'medium':
+        reason = f"Wallet behavior is mixed: {tx_count} txs, {failed_ratio*100:.1f}% failed, {z_score:.1f}σ from wallet average"
     else:
-        reason = f"Amount within normal range for this wallet (avg {avg_amount:.2f} ETH)"
+        reason = f"Wallet behavior is stable: {tx_count} txs with {counterparties} counterparties and low failure rate"
 
     return {
         'threshold'        : round(threshold, 4),
@@ -89,55 +102,41 @@ def calculate_dynamic_threshold(sender_address: str, current_amount: float) -> d
         'std_dev'          : round(std_dev, 4),
         'amount_deviation' : round(z_score, 4),
         'tx_count'         : tx_count,
-        'amount_rule'      : amount_rule['action'],
+        'counterparties'   : counterparties,
+        'failed_ratio'     : round(failed_ratio, 4),
     }
 
 
-def make_decision(fraud_probability: float, threshold: float,
-                  amount: float, amount_rule: str) -> dict:
-    """
-    Decision combines AI score + amount rule.
-    Amount rule can force FREEZE/BLOCK regardless of AI score.
-    """
-    # Amount rule overrides
-    if amount_rule == 'BLOCK' and amount > 50:
-        return {
-            'decision': 'FRAUDULENT',
-            'action'  : 'BLOCK',
-            'fraud_probability': fraud_probability,
-            'threshold'        : threshold,
-            'override'         : 'Amount > 50 ETH — auto-blocked',
-        }
-    if amount_rule == 'FREEZE':
-        if fraud_probability > threshold:
-            return {
-                'decision': 'FRAUDULENT',
-                'action'  : 'BLOCK',
-                'fraud_probability': fraud_probability,
-                'threshold'        : threshold,
-                'override'         : 'Freeze range + fraud score exceeds threshold',
-            }
-        return {
-            'decision': 'SUSPICIOUS',
-            'action'  : 'FREEZE',
-            'fraud_probability': fraud_probability,
-            'threshold'        : threshold,
-            'override'         : 'Amount in freeze range (26–50 ETH)',
-        }
+def make_decision(fraud_probability: float, threshold: float, risk_level: str, confirmed: bool = False) -> dict:
+    """Return review status without using fixed amount bands."""
+    fraud_probability = round(float(fraud_probability), 4)
+    threshold = round(float(threshold), 4)
 
-    # Normal AI-based decision
-    is_fraud = fraud_probability > threshold
-    if is_fraud:
-        action = 'BLOCK_AND_BLACKLIST' if fraud_probability > 0.88 else 'BLOCK'
+    if fraud_probability >= threshold + 0.12 or risk_level == 'high':
+        confirmation_level = 'high'
+        requires_confirmation = True
+    elif fraud_probability >= threshold or risk_level == 'medium':
+        confirmation_level = 'medium'
+        requires_confirmation = True
     else:
-        action = 'APPROVE_WITH_WARNING' if fraud_probability > threshold * 0.85 else 'APPROVE'
+        confirmation_level = 'low'
+        requires_confirmation = False
+
+    if requires_confirmation and not confirmed:
+        action = 'REVIEW_REQUIRED'
+    elif requires_confirmation and confirmed:
+        action = 'APPROVE_AFTER_CONFIRMATION'
+    else:
+        action = 'APPROVE'
 
     return {
-        'decision'         : 'FRAUDULENT' if is_fraud else 'SAFE',
-        'action'           : action,
-        'fraud_probability': round(fraud_probability, 4),
-        'threshold'        : round(threshold, 4),
-        'override'         : None,
+        'decision'             : 'FRAUDULENT' if fraud_probability >= threshold else 'SAFE',
+        'action'               : action,
+        'fraud_probability'    : fraud_probability,
+        'threshold'            : threshold,
+        'override'             : None,
+        'requires_confirmation': requires_confirmation,
+        'confirmation_level'   : confirmation_level,
     }
 
 
@@ -161,15 +160,11 @@ def generate_ai_explanation(features: dict, fraud_probability: float,
     volatility  = features.get('amount_volatility', 0)
     risk_level  = thresh_data.get('risk_level', 'medium')
 
-    # Amount analysis
-    if amount > 50:
-        reasons.append('Amount exceeds 50 ETH — exceeds maximum safe limit')
-    elif amount > 25:
-        reasons.append(f'Amount {amount:.2f} ETH is in the freeze zone (26–50 ETH)')
-    elif z_score > 3:
-        reasons.append(f'Amount {amount:.2f} ETH is {z_score:.1f}× above wallet normal ({avg_amount:.2f} ETH)')
-    elif z_score > 1.5:
-        reasons.append(f'Amount moderately elevated above wallet average ({avg_amount:.2f} ETH)')
+    # Amount behavior, not fixed amount rules
+    if z_score > 4:
+        reasons.append(f'Current amount is {z_score:.1f}σ above wallet average ({avg_amount:.2f} ETH)')
+    elif z_score > 2:
+        reasons.append(f'Current amount is elevated above wallet average ({avg_amount:.2f} ETH)')
 
     # New wallet
     if tx_count == 0:
@@ -179,7 +174,7 @@ def generate_ai_explanation(features: dict, fraud_probability: float,
 
     # Receiver
     if features.get('sent_unique_recv', 0) > 50:
-        reasons.append('Sender interacts with unusually high number of unique receivers')
+        reasons.append('Wallet interacts with an unusually high number of counterparties')
     elif recv_count == 0:
         reasons.append('Receiver wallet has no prior incoming transaction record')
 

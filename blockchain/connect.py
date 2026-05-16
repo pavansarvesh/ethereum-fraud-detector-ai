@@ -442,11 +442,20 @@ def execute_eth_transfer(sender: str, receiver: str, amount_eth: float) -> dict:
         return {"success": False, "error": "Blockchain not connected"}
 
     try:
-        receiver_addr = Web3.to_checksum_address(receiver) if len(str(receiver)) == 42 else None
-        if not receiver_addr:
+        if not sender or not Web3.is_address(sender):
+            return {"success": False, "error": "Invalid sender address", "sender": sender, "receiver": receiver}
+        if not receiver or not Web3.is_address(receiver):
             return {"success": False, "error": "Invalid receiver address", "sender": sender, "receiver": receiver}
 
+        sender_addr = Web3.to_checksum_address(sender)
+        receiver_addr = Web3.to_checksum_address(receiver)
+        zero_address = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
+        if sender_addr == zero_address or receiver_addr == zero_address:
+            return {"success": False, "error": "Zero address is not allowed", "sender": sender_addr, "receiver": receiver_addr}
+
         amount_wei = w3.to_wei(float(amount_eth), "ether")
+        if amount_wei <= 0:
+            return {"success": False, "error": "Transfer amount must be greater than zero", "sender": sender_addr, "receiver": receiver_addr, "amount_eth": float(amount_eth)}
 
         signing_key = None
         if GANACHE_PRIVATE_KEY and len(GANACHE_PRIVATE_KEY) == 66:
@@ -469,19 +478,32 @@ def execute_eth_transfer(sender: str, receiver: str, amount_eth: float) -> dict:
                         "amount_eth": float(amount_eth),
                     }
         else:
-            if not sender or len(str(sender)) != 42:
-                return {"success": False, "error": "Sender address required for unlocked account transfer", "sender": sender, "receiver": receiver_addr}
             sender_addr = Web3.to_checksum_address(sender)
+            if sender_addr not in w3.eth.accounts:
+                return {
+                    "success": False,
+                    "error": "Sender account is not available as an unlocked Ganache account",
+                    "sender": sender_addr,
+                    "receiver": receiver_addr,
+                }
 
         balance_wei = w3.eth.get_balance(sender_addr)
-        if balance_wei < amount_wei:
+        gas_limit = 21000
+        gas_price = w3.eth.gas_price
+        total_required = amount_wei + (gas_limit * gas_price)
+        if balance_wei < total_required:
             return {
                 "success": False,
-                "error": f"Insufficient balance. Have {float(w3.from_wei(balance_wei, 'ether')):.4f} ETH, need {float(amount_eth):.4f} ETH",
+                "error": (
+                    f"Insufficient balance. Have {float(w3.from_wei(balance_wei, 'ether')):.4f} ETH, "
+                    f"need {float(w3.from_wei(total_required, 'ether')):.4f} ETH including gas"
+                ),
                 "sender": sender_addr,
                 "receiver": receiver_addr,
                 "balance": float(w3.from_wei(balance_wei, "ether")),
                 "amount_eth": float(amount_eth),
+                "estimated_gas": gas_limit,
+                "gas_price_wei": gas_price,
             }
 
         nonce = w3.eth.get_transaction_count(sender_addr)
@@ -490,8 +512,8 @@ def execute_eth_transfer(sender: str, receiver: str, amount_eth: float) -> dict:
             "to": receiver_addr,
             "value": amount_wei,
             "nonce": nonce,
-            "gas": 21000,
-            "gasPrice": w3.eth.gas_price,
+            "gas": gas_limit,
+            "gasPrice": gas_price,
         }
 
         if signing_key:

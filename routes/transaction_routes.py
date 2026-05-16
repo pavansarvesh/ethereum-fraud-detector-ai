@@ -46,6 +46,7 @@ def analyze_transaction():
     tx_hash    = data.get('tx_hash', f'TX-{uuid.uuid4().hex[:12].upper()}')
     timestamp  = data.get('timestamp', datetime.now().timestamp())
     check_only = data.get('check_only', False)  # If True, skip DB/blockchain persistence
+    confirmed  = data.get('confirmed', False)
 
     # ── Blacklist check ────────────────────────────────────────────────────────
     if is_blacklisted(sender):
@@ -60,12 +61,12 @@ def analyze_transaction():
             _save_alert_and_event(result, sender, receiver)
         return jsonify(result), 200
 
-    # ── Feature engineering ────────────────────────────────────────────────────
-    sender_history   = get_sender_history(sender, limit=200)
-    receiver_history = get_receiver_history(receiver, limit=200)
-    features         = engineer_features(
+    # ── Feature engineering (receiver-centric analysis) ───────────────────────
+    receiver_sent_history = get_sender_history(receiver, limit=200)
+    receiver_recv_history = get_receiver_history(receiver, limit=200)
+    features = engineer_features(
         {'amount': amount, 'receiver': receiver, 'timestamp': timestamp},
-        sender_history, receiver_history
+        receiver_sent_history, receiver_recv_history
     )
 
     # ── AI prediction ──────────────────────────────────────────────────────────
@@ -73,29 +74,66 @@ def analyze_transaction():
     fraud_prob = prediction['fraud_probability']
 
     # ── Dynamic threshold ──────────────────────────────────────────────────────
-    thresh_data = calculate_dynamic_threshold(sender, amount)
+    thresh_data = calculate_dynamic_threshold(receiver, amount)
     threshold   = thresh_data['threshold']
     risk_level  = thresh_data['risk_level']
-    amount_rule = thresh_data.get('amount_rule', 'SAFE')
 
     # ── Decision ───────────────────────────────────────────────────────────────
-    dec_data = make_decision(fraud_prob, threshold, amount, amount_rule)
+    dec_data = make_decision(fraud_prob, threshold, risk_level, confirmed=confirmed)
     decision = dec_data['decision']
     action   = dec_data['action']
+    requires_confirmation = dec_data.get('requires_confirmation', False)
+    confirmation_level = dec_data.get('confirmation_level', 'low')
 
     # ── AI Explanation ─────────────────────────────────────────────────────────
     explanation = generate_ai_explanation(
         features, fraud_prob, threshold, decision, thresh_data, amount
     )
 
+    if not check_only and requires_confirmation and not confirmed:
+        return jsonify({
+            'tx_hash'              : tx_hash,
+            'sender'               : sender,
+            'receiver'             : receiver,
+            'amount'               : amount,
+            'hour'                 : features.get('hour', datetime.now().hour),
+            'fraud_probability'    : fraud_prob,
+            'normal_probability'   : prediction['normal_probability'],
+            'threshold'            : threshold,
+            'risk_level'           : risk_level,
+            'decision'             : decision,
+            'action'               : action,
+            'requires_confirmation': True,
+            'confirmation_level'   : confirmation_level,
+            'blockchain_hash'      : '',
+            'block_number'         : 0,
+            'gas_used'             : 0,
+            'blockchain_simulated' : True,
+            'transfer_executed'    : False,
+            'transfer_result'      : {'success': False, 'requires_confirmation': True},
+            'model_used'           : prediction['model_used'],
+            'avg_sender_amount'    : thresh_data.get('avg_amount', 0),
+            'amount_deviation'     : thresh_data.get('amount_deviation', 0),
+            'threshold_reason'     : thresh_data.get('reason', ''),
+            'explanation'          : explanation,
+            'features'             : {k: v for k, v in features.items() if k != 'receiver'},
+            'timestamp'            : datetime.now().isoformat(),
+        }), 200
+
     # ── Execute ETH transfer if approved ──────────────────────────────────────
     transfer_result = {'success': False, 'simulated': True}
-    if not check_only and action in ('APPROVE', 'APPROVE_WITH_WARNING'):
+    if not check_only and (confirmed or not requires_confirmation):
         transfer_result = execute_eth_transfer(sender, receiver, amount)
         if not transfer_result.get('success'):
-            action = 'BLOCK'
-            decision = 'FRAUDULENT'
-            explanation.insert(0, f"Transfer execution failed: {transfer_result.get('error', 'Unknown error')}")
+            error_text = str(transfer_result.get('error', 'Unknown error'))
+            if 'Insufficient balance' in error_text:
+                action = 'INSUFFICIENT_BALANCE'
+                decision = 'ABORTED'
+                explanation.insert(0, error_text)
+            else:
+                action = 'BLOCK'
+                decision = 'FRAUDULENT'
+                explanation.insert(0, f"Transfer execution failed: {error_text}")
 
     # ── Blockchain log (skip for check_only) ───────────────────────────────────
     bc = {'blockchain_hash': '', 'block_number': 0, 'simulated': True}
@@ -130,7 +168,7 @@ def analyze_transaction():
         'blockchain_hash'  : transfer_result.get('tx_hash', bc.get('blockchain_hash', '')) if transfer_result.get('success') else bc.get('blockchain_hash', ''),
         'block_number'     : transfer_result.get('block_number', bc.get('block_number', 0)) if transfer_result.get('success') else bc.get('block_number', 0),
         'gas_used'         : transfer_result.get('gas_used', bc.get('gas_used', 0)) if transfer_result.get('success') else bc.get('gas_used', 0),
-        'failed'           : 1 if action in ('BLOCK','BLOCK_AND_BLACKLIST','FREEZE') or not transfer_result.get('success') and action in ('APPROVE','APPROVE_WITH_WARNING') else 0,
+        'failed'           : 1 if action in ('BLOCK','BLOCK_AND_BLACKLIST','INSUFFICIENT_BALANCE') or (not transfer_result.get('success') and action.startswith('APPROVE')) else 0,
     }
     if not check_only:
         save_transaction(tx_record)
@@ -143,7 +181,8 @@ def analyze_transaction():
         'avg_sender_amount'   : thresh_data.get('avg_amount', 0),
         'amount_deviation'    : thresh_data.get('amount_deviation', 0),
         'threshold_reason'    : thresh_data.get('reason', ''),
-        'amount_rule'         : amount_rule,
+        'requires_confirmation': requires_confirmation,
+        'confirmation_level'  : confirmation_level,
         'explanation'         : explanation,
         'blockchain_simulated': bc.get('simulated', True) and not transfer_result.get('success', False),
         'transfer_executed'   : transfer_result.get('success', False),
@@ -157,7 +196,7 @@ def analyze_transaction():
 def _save_alert_and_event(tx: dict, sender: str, receiver: str):
     """Persist alert and SC event for blocked/frozen transactions."""
     action = tx.get('action', '')
-    if action in ('BLOCK', 'BLOCK_AND_BLACKLIST', 'FREEZE'):
+    if action in ('BLOCK', 'BLOCK_AND_BLACKLIST', 'REVIEW_REQUIRED', 'INSUFFICIENT_BALANCE'):
         alert_text = (
             f"{action}: {sender[:10]}...->{receiver[:10]}... | "
             f"Score: {tx.get('fraud_probability',0)*100:.1f}% | "
@@ -168,8 +207,9 @@ def _save_alert_and_event(tx: dict, sender: str, receiver: str):
         save_alert(alert_text, alert_type)
 
         fn = ('blockTransaction() + blacklistWallet()' if action == 'BLOCK_AND_BLACKLIST'
-              else 'freezeTransaction()' if action == 'FREEZE'
-              else 'blockTransaction()')
+             else 'reviewTransaction()' if action == 'REVIEW_REQUIRED'
+               else 'insufficientBalance()' if action == 'INSUFFICIENT_BALANCE'
+             else 'blockTransaction()')
         save_sc_event({
             'fn'    : fn,
             'sender': sender,
@@ -199,7 +239,6 @@ def _build_blocked_result(tx_hash, sender, receiver, amount, explanation):
         'block_number'      : 0,
         'explanation'       : explanation,
         'model_used'        : 'Blacklist',
-        'amount_rule'       : 'BLOCK',
         'threshold_reason'  : 'Blacklisted wallet',
         'blockchain_simulated': True,
         'timestamp'         : datetime.now().isoformat(),
@@ -346,4 +385,3 @@ def wallet_stats_chain(address):
         })
     except Exception as e:
         return jsonify({'error': str(e), 'address': address})
-

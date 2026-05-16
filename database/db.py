@@ -266,6 +266,21 @@ def get_receiver_history(receiver_address: str, limit: int = 200) -> list:
     conn.close()
     return rows
 
+def get_wallet_history(address: str, limit: int = 200) -> list:
+    """Get recent transactions where the address appeared as sender or receiver."""
+    conn = get_connection(); c = conn.cursor()
+    c.execute("""
+        SELECT id, amount, hour, decision, failed, sender, receiver, blockchain_hash, block_number
+        FROM transactions WHERE sender=?
+        UNION ALL
+        SELECT id, amount, hour, decision, failed, sender, receiver, blockchain_hash, block_number
+        FROM transactions WHERE receiver=?
+        ORDER BY id DESC LIMIT ?
+    """, (address, address, limit))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
 # ── Gas Analytics ─────────────────────────────────────────────────────────────
 def get_gas_analytics() -> dict:
     """Returns gas usage stats from real blockchain data."""

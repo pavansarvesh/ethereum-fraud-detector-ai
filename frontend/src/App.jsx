@@ -42,6 +42,7 @@ export default function App() {
   const [chainThreshHistory, setChainThreshHistory] = useState([])  // Phase 5
   const [modelIntegrity,     setModelIntegrity    ] = useState(null) // Phase 3
   const [verifyHash,         setVerifyHash        ] = useState('')
+  const [pendingTx,          setPendingTx        ] = useState(null)
   const ethListenersRef = useRef(false)
 
   const fetchData = useCallback(async () => {
@@ -65,34 +66,30 @@ export default function App() {
       }
       if(bRes.ok) setBlockInfo(await bRes.json())
       if(cRes.ok) setChain(await cRes.json())
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Fetch persistent alerts from DB
   const fetchAlertsFromDB = useCallback(async () => {
     try {
       const res = await fetch(`${API}/alerts?limit=50`)
       if(res.ok) setAlerts(await res.json())
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Fetch persistent SC events from DB
   const fetchSCEvents = useCallback(async () => {
     try {
       const res = await fetch(`${API}/sc_events?limit=20`)
       if(res.ok) setScEvents(await res.json())
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Clear alerts from DB
   const clearAlertsDB = useCallback(async () => {
     try {
       await fetch(`${API}/alerts/clear`, {method:'DELETE'})
       setAlerts([])
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Fetch network data
   const fetchNetworkData = useCallback(async () => {
     try {
       const [nRes, gRes, bkRes] = await Promise.all([
@@ -103,18 +100,16 @@ export default function App() {
       if(nRes.ok) setNetworkStats(await nRes.json())
       if(gRes.ok) setGasAnalytics(await gRes.json())
       if(bkRes.ok) setBlacklist(await bkRes.json())
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Remove wallet from blacklist
   const removeFromBlacklist = useCallback(async (address) => {
     try {
       await fetch(`${API}/blacklist/${encodeURIComponent(address)}`, {method:'DELETE'})
       setBlacklist(prev => prev.filter(w => w.address !== address))
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Phase 5: Fetch threshold history from blockchain
   const fetchChainThresholdHistory = useCallback(async (address) => {
     if(!address) return
     try {
@@ -123,15 +118,14 @@ export default function App() {
         const d = await res.json()
         if(d.history?.length > 0) setChainThreshHistory(d.history)
       }
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
-  // Phase 3: Fetch model integrity
   const fetchModelIntegrity = useCallback(async () => {
     try {
       const res = await fetch(`${API}/blockchain/model_integrity`)
       if(res.ok) setModelIntegrity(await res.json())
-    } catch(_){}
+    } catch(_){ }
   }, [])
 
   const fetchGanacheBlock = useCallback(async () => {
@@ -142,7 +136,7 @@ export default function App() {
       })
       const d = await res.json()
       if(d.result) setGanacheBlk(parseInt(d.result,16))
-    } catch(_){}
+    } catch(_){ }
   },[])
 
   const fetchBalance = useCallback(async(addr, showDiff=false)=>{
@@ -172,12 +166,11 @@ export default function App() {
           const newBal=(Number(BigInt(b))/1e18).toFixed(4)
           balanceRef.current = newBal
           setBalance(newBal)
-        }catch(_){}
+        }catch(_){ }
       }
     }
   },[])
 
-  // Fetch wallet-specific transactions
   const fetchWalletTxs = useCallback(async(addr) => {
     try {
       const res = await fetch(`${API}/transactions?limit=50`)
@@ -193,8 +186,35 @@ export default function App() {
         })
         setWalletTxList(walletTxs)
       }
-    } catch(_){}
+    } catch(_){ }
   },[])
+
+  async function runBackendAnalysis(payload, {checkOnly = false, confirmed = false} = {}) {
+    const res = await fetch(`${API}/analyze_transaction`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        ...payload,
+        check_only: checkOnly,
+        confirmed,
+      })
+    })
+    if(!res.ok) throw new Error(`Server error ${res.status}`)
+    return await res.json()
+  }
+
+  function mapReceiverRisk(data, address) {
+    if(!data) return null
+    return {
+      address,
+      fraud_score: data.fraud_probability,
+      risk_level: data.risk_level,
+      threshold: data.threshold,
+      tx_count: data.features?.total_tx_count || data.features?.sent_count || 0,
+      recv_unique: data.features?.recv_unique_send || 0,
+      zero_recv: data.features?.zero_recv_flag || 0,
+      high_fan_out: data.features?.high_fan_out || 0,
+    }
+  }
 
   useEffect(()=>{
     fetchData(); fetchGanacheBlock()
@@ -252,7 +272,16 @@ export default function App() {
     if(!txSender)   {setMessage('Enter sender address or connect wallet.');return}
     if(!txReceiver) {setMessage('Enter a recipient address.');return}
     if(!txAmount||parseFloat(txAmount)<=0){setMessage('Enter a valid amount > 0.');return}
-    setSending(true); setMessage('Analyzing wallet history with XGBoost & executing transfer if approved...')
+
+    const payload = {
+      sender: txSender,
+      receiver: txReceiver,
+      amount: parseFloat(txAmount),
+      tx_hash: txHash,
+      timestamp: txTimestamp,
+    }
+
+    setSending(true)
     setReceiverRisk(null)
     try{
       if(overrides.seedHistory){
@@ -263,93 +292,49 @@ export default function App() {
         if(!seedRes.ok) throw new Error(`Unable to seed demo history (${seedRes.status})`)
       }
 
-      // ── Analyze transaction & execute on backend ────────────────────────────
-      const res=await fetch(`${API}/analyze_transaction`,{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({sender:txSender,receiver:txReceiver,amount:parseFloat(txAmount),
-          tx_hash:txHash,timestamp:txTimestamp})
-      })
-      if(!res.ok)throw new Error(`Server error ${res.status}`)
-      const data=await res.json()
-      setLastResult(data)
+      setMessage('Analyzing receiver wallet history with XGBoost...')
+      const analysis = await runBackendAnalysis(payload, {checkOnly:true, confirmed:false})
+      setLastResult(analysis)
+      setReceiverRisk(mapReceiverRisk(analysis, txReceiver))
 
-      const blocked = data.action==='BLOCK'||data.action==='BLOCK_AND_BLACKLIST'
-      const frozen  = data.action==='FREEZE'
-      if(blocked||frozen){
-        setMessage(blocked?`❌ Transaction BLOCKED by AI — Fraud ${pct(data.fraud_probability)}. No ETH transferred.`:
-                         `⚠️ Transaction FROZEN — Review required. No ETH transferred.`)
-        setAlerts(p=>[{
-          text:`${data.action}: ${short(txSender)} → ${short(txReceiver)} | Score: ${pct(data.fraud_probability)} | Threshold: ${pct(data.threshold)} | Amount: ${data.amount} ETH`,
-          time:new Date().toLocaleTimeString(),type:blocked?'danger':'warn'
-        },...p.slice(0,19)])
-        if(walletAddr){
-          await fetchBalance(walletAddr, true)
-          if(txReceiver?.startsWith('0x') && txReceiver.length===42) await fetchBalance(txReceiver, true)
-        }
-        return data
-      }
-
-      const approved = data.transfer_executed
-
-      if(approved) {
-        const tr = data.transfer_result
-        setMessage(`✅ Transaction APPROVED & EXECUTED. Sender debited ${tr.amount_eth} ETH, receiver credited. Fraud score ${pct(data.fraud_probability)}.`)
-      } else {
-        setMessage(`✅ Transaction APPROVED by AI — Fraud ${pct(data.fraud_probability)}.`)
-      }
-
-      // ── Track risk history for wallet risk score graph ─────────────────────
       setRiskHistory(prev=>{
         const newPoint={
           tx   : `TX${prev.length+1}`,
-          score: parseFloat((data.fraud_probability*100).toFixed(1)),
-          threshold: parseFloat((data.threshold*100).toFixed(0)),
-          amount: parseFloat(data.amount),
-          action: data.action,
+          score: parseFloat((analysis.fraud_probability*100).toFixed(1)),
+          threshold: parseFloat((analysis.threshold*100).toFixed(0)),
+          amount: parseFloat(analysis.amount),
+          action: analysis.action,
           time : new Date().toLocaleTimeString(),
         }
         return [...prev.slice(-19), newPoint]
       })
 
-      // ── Analyze receiver wallet separately ─────────────────────────────────
-      try {
-        const recvRes = await fetch(`${API}/analyze_transaction`,{
-          method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({
-            sender   : txReceiver,
-            receiver : txSender,
-            amount   : 0.001,
-            tx_hash  : `RECV-CHECK-${Date.now()}`,
-            timestamp: Date.now()/1000,
-            check_only: true
-          })
-        })
-        if(recvRes.ok){
-          const recvData = await recvRes.json()
-          setReceiverRisk({
-            address       : recipient,
-            fraud_score   : recvData.fraud_probability,
-            risk_level    : recvData.risk_level,
-            threshold     : recvData.threshold,
-            tx_count      : recvData.features?.sent_count||0,
-            recv_unique   : recvData.features?.recv_unique_send||0,
-            zero_recv     : recvData.features?.zero_recv_flag||0,
-            high_fan_out  : recvData.features?.high_fan_out||0,
-          })
-        }
-      } catch(_){}
+      if(analysis.requires_confirmation){
+        setPendingTx(payload)
+        setMessage(`⚠️ Receiver fraud score ${pct(analysis.fraud_probability)} needs confirmation. Proceed or cancel to continue.`)
+        return analysis
+      }
 
+      const autoData = await runBackendAnalysis(payload, {checkOnly:false, confirmed:true})
+      setLastResult(autoData)
+      setReceiverRisk(mapReceiverRisk(autoData, txReceiver))
+      setMessage(autoData.action==='INSUFFICIENT_BALANCE'
+        ? '⚠️ Insufficient balance. Transaction aborted before sending.'
+        : `✅ Transaction auto-approved. Receiver fraud score ${pct(autoData.fraud_probability)}.`)
       setScEvents(p=>[{
-        fn   :data.action==='BLOCK_AND_BLACKLIST'?'blockTransaction() + blacklistWallet()':
-              data.action==='FREEZE'?'freezeTransaction()': data.action==='APPROVE_WITH_WARNING'?'approveTransactionWithWarning()':'approveTransaction()',
+        fn   :'approveTransaction()',
         sender:short(txSender),recv:short(txReceiver),
-        score:pct(data.fraud_probability),thresh:pct(data.threshold),
-        hash :data.tx_hash,block:data.block_number||'—',
-        amount:data.amount,time:new Date().toLocaleTimeString()
+        score:pct(autoData.fraud_probability),thresh:pct(autoData.threshold),
+        hash :autoData.tx_hash,block:autoData.block_number||'—',
+        amount:autoData.amount,time:new Date().toLocaleTimeString()
       },...p.slice(0,9)])
+      await fetchData()
+      setTimeout(()=>fetchData(), 1500)
+      setTimeout(()=>fetchAlertsFromDB(), 500)
+      setTimeout(()=>fetchSCEvents(), 600)
+      setTimeout(()=>fetchNetworkData(), 800)
       if(walletAddr){
         await fetchBalance(walletAddr, true)
-        setTimeout(()=>fetchBalance(walletAddr, true), 2000)
         setTimeout(()=>fetchWalletTxs(walletAddr), 1000)
       }
       if(txReceiver?.startsWith('0x') && txReceiver.length===42){
@@ -358,16 +343,60 @@ export default function App() {
       if(txSender?.startsWith('0x') && txSender.length===42){
         setTimeout(()=>fetchBalance(txSender, true), 1500)
       }
+      return autoData
+    }catch(e){
+      setMessage(e.message?.includes('fetch')?'Backend not reachable. Run: python app.py':e.message)
+    }finally{setSending(false)}
+  }
+
+  async function confirmPendingTransaction(proceed){
+    if(!pendingTx) return
+    if(!proceed){
+      setPendingTx(null)
+      setMessage('Transaction cancelled before execution.')
+      return
+    }
+    setSending(true)
+    try{
+      const data = await runBackendAnalysis(pendingTx, {checkOnly:false, confirmed:true})
+      setLastResult(data)
+      setReceiverRisk(mapReceiverRisk(data, pendingTx.receiver))
+      setMessage(data.action==='INSUFFICIENT_BALANCE'
+        ? '⚠️ Insufficient balance. Transaction aborted before sending.'
+        : `✅ Transaction completed after confirmation. Receiver fraud score ${pct(data.fraud_probability)}.`)
+      setScEvents(p=>[{
+        fn   :'approveTransactionAfterConfirmation()',
+        sender:short(pendingTx.sender),recv:short(pendingTx.receiver),
+        score:pct(data.fraud_probability),thresh:pct(data.threshold),
+        hash :data.tx_hash,block:data.block_number||'—',
+        amount:data.amount,time:new Date().toLocaleTimeString()
+      },...p.slice(0,9)])
       await fetchData()
       setTimeout(()=>fetchData(), 1500)
       setTimeout(()=>fetchAlertsFromDB(), 500)
       setTimeout(()=>fetchSCEvents(), 600)
       setTimeout(()=>fetchNetworkData(), 800)
-      // Phase 5: Refresh threshold history from chain
-      if(sender) setTimeout(()=>fetchChainThresholdHistory(sender), 2000)
+      if(walletAddr){
+        await fetchBalance(walletAddr, true)
+        setTimeout(()=>fetchWalletTxs(walletAddr), 1000)
+      }
+      if(pendingTx.receiver?.startsWith('0x') && pendingTx.receiver.length===42){
+        await fetchBalance(pendingTx.receiver, true)
+      }
+      if(pendingTx.sender?.startsWith('0x') && pendingTx.sender.length===42){
+        setTimeout(()=>fetchBalance(pendingTx.sender, true), 1500)
+      }
+      await fetchData()
+      setTimeout(()=>fetchData(), 1500)
+      setTimeout(()=>fetchAlertsFromDB(), 500)
+      setTimeout(()=>fetchSCEvents(), 600)
+      setTimeout(()=>fetchNetworkData(), 800)
     }catch(e){
       setMessage(e.message?.includes('fetch')?'Backend not reachable. Run: python app.py':e.message)
-    }finally{setSending(false)}
+    }finally{
+      setPendingTx(null)
+      setSending(false)
+    }
   }
 
   const handleAnalyze = () => analyzeTransaction()
@@ -393,10 +422,9 @@ export default function App() {
     setExportingPDF(true)
     try{
       const w = window.open('','_blank')
-      const blocked = result.action==='BLOCK'||result.action==='BLOCK_AND_BLACKLIST'
-      const frozen  = result.action==='FREEZE'
-      const statusColor = blocked?'#ef4444':frozen?'#f59e0b':'#22c55e'
-      const statusText  = blocked?'BLOCKED':frozen?'FROZEN':'APPROVED'
+      const review = String(result.action||'').includes('REVIEW')
+      const statusColor = review?'#f59e0b':'#22c55e'
+      const statusText  = review?'REVIEW REQUIRED':'APPROVED'
       const reasons = (result.explanation||[]).map(r=>`<li style="margin:6px 0;color:#374151">${r}</li>`).join('')
       const recvSection = receiverRisk ? `
         <div class="section">
@@ -443,11 +471,12 @@ export default function App() {
       <div class="section">
         <h3>AI Fraud Analysis</h3>
         <table><tbody>
-          <tr><td>Fraud Probability</td><td class="val" style="color:${statusColor}">${pct(result.fraud_probability)}</td></tr>
+          <tr><td>Receiver Risk Score</td><td class="val" style="color:${statusColor}">${pct(result.fraud_probability)}</td></tr>
           <tr><td>Normal Probability</td><td class="val" style="color:#16a34a">${pct(result.normal_probability)}</td></tr>
           <tr><td>Dynamic Threshold</td><td class="val" style="color:#d97706">${pct(result.threshold)}</td></tr>
           <tr><td>Risk Level</td><td class="val">${(result.risk_level||'').toUpperCase()}</td></tr>
-          <tr><td>Amount Rule</td><td class="val">${result.amount_rule||'SAFE'}</td></tr>
+          <tr><td>Confirmation</td><td class="val">${result.requires_confirmation?'USER CONFIRMATION':'AUTO PROCEED'}</td></tr>
+          <tr><td>Confirmation Level</td><td class="val">${(result.confirmation_level||'low').toUpperCase()}</td></tr>
           <tr><td>Decision</td><td class="val" style="color:${statusColor}">${result.decision}</td></tr>
           <tr><td>Action Taken</td><td class="val" style="color:${statusColor}">${result.action}</td></tr>
           <tr><td>Model Used</td><td class="val">XGBoost — Ethereum Phishing Dataset (2.97M nodes)</td></tr>
@@ -472,20 +501,19 @@ export default function App() {
 
   function loadScenario(s,r,a){setSender(s||walletAddr||'');setRecipient(r);setAmount(String(a));setMessage('Scenario loaded — click Analyze Transaction.')}
 
-  // Amount rule helper for UI preview
-  function getAmountRule(a){
-    const v=parseFloat(a||0)
-    if(v<=0.00001)return{label:'LOW',color:'#22c55e',desc:'Small transfer'}
-    if(v<=25)     return{label:'NORMAL',color:'#22c55e',desc:'Model decides from wallet history'}
-    if(v<=50)     return{label:'ELEVATED',color:'#f59e0b',desc:'Model will still score by behavior history'}
-    return              {label:'ELEVATED',color:'#f59e0b',desc:'Amount is not the decision rule'}
+  // History-driven preview for the transaction form
+  function getHistoryPreview(){
+    return {label:'HISTORY',color:'#7c3aed',desc:'Receiver wallet history drives the model score'}
   }
 
   const safeCount  = stats?(stats.total_transactions-stats.fraud_detected):0
   const fraudCount = stats?.fraud_detected??0
   const pieData    = safeCount+fraudCount>0
-    ?[{name:'Safe',value:safeCount},{name:'Fraud/Freeze',value:fraudCount}]
+    ?[{name:'Safe',value:safeCount},{name:'Fraud/Review',value:fraudCount}]
     :[{name:'No data',value:1}]
+  const approvedWalletTxs = walletTxList.filter(tx => String(tx.action || '').startsWith('APPROVE'))
+  const confirmationResult = pendingTx && lastResult ? lastResult : null
+  const confirmationHistory = [...riskHistory].slice(-6).reverse()
   const barData  = [...txList].slice(0,10).reverse().map((tx,i)=>({
     name:`T${i+1}`,fraud:parseFloat((tx.fraud_probability*100).toFixed(1)),
     threshold:parseFloat((tx.threshold*100).toFixed(0))
@@ -497,7 +525,7 @@ export default function App() {
   const statusLabel={connected:'Connected',disconnected:'Disconnected',connecting:'Connecting',error:'Needs attention'}[connStatus]
   const compactAddr=walletAddr?`${walletAddr.slice(0,6)}...${walletAddr.slice(-4)}`:'No wallet linked'
   const chainLive=ganacheBlk!=null||blockInfo?.connected
-  const amountRule=getAmountRule(amount)
+  const amountRule=getHistoryPreview(amount)
 
   return(
     <div className="app-shell">
@@ -542,7 +570,7 @@ export default function App() {
               <div className={`status-badge ${connStatus}`}><span className="status-dot"/>{statusLabel}{walletAddr&&<span style={{marginLeft:8,fontSize:10,opacity:.7}}>| {network} | {balance} ETH</span>}</div>
               <p className="eyebrow">Ethereum AI Fraud Detection</p>
               <h1>Detect phishing wallets with real-time AI analysis.</h1>
-              <p className="hero-copy">XGBoost trained on Ethereum wallet behavior. The model scores wallet history, counterparties, activity timing, and transfer patterns. No fixed freeze/block amount bands.</p>
+              <p className="hero-copy">XGBoost trained on Ethereum wallet behavior. The model scores wallet history, counterparties, activity timing, and transfer patterns. No fixed amount bands.</p>
               <div className="hero-actions">
                 <button className="primary-button" onClick={handleConnect} disabled={connStatus==='connecting'}>{connStatus==='connected'?'Reconnect wallet':connStatus==='connecting'?'Connecting...':'Connect MetaMask'}</button>
                 <div className="address-chip">{compactAddr}</div>
@@ -563,7 +591,7 @@ export default function App() {
               {[
                 {label:'Total Transactions',  value:stats?.total_transactions??0,   color:'#818cf8'},
                 {label:'Fraud Detected',       value:stats?.fraud_detected??0,       color:'#ef4444'},
-                {label:'Blocked / Frozen',     value:stats?.transactions_blocked??0, color:'#ef4444'},
+                {label:'Review Required',      value:stats?.transactions_blocked??0, color:'#ef4444'},
                 {label:'Active Wallets',       value:stats?.active_wallets??0,       color:'#f59e0b'},
                 {label:'Avg Fraud Score',      value:stats?`${stats.avg_fraud_score}%`:'0%',color:'#a855f7'},
               ].map(({label,value,color})=>(
@@ -622,7 +650,7 @@ export default function App() {
               <div className="panel-header"><div><p className="eyebrow muted">Live Feed</p><h2>Recent Transactions</h2></div><div className="panel-note">Auto-refreshes every 8s</div></div>
               <div className="table-wrap">
                 <table className="tx-table">
-                  <thead><tr>{['TX Hash','Sender','Receiver','Amount','Fraud Score','Threshold','Risk','Decision','Action'].map(h=><th key={h}>{h}</th>)}</tr></thead>
+                    <thead><tr>{['TX Hash','Sender','Receiver','Amount','Receiver Score','Threshold','Risk','Decision','Action'].map(h=><th key={h}>{h}</th>)}</tr></thead>
                   <tbody>
                     {txList.length===0?<tr><td colSpan={10} className="empty-row">No transactions yet. Use the Analyze tab.</td></tr>
                     :txList.map((tx,i)=>{const fp=parseFloat(tx.fraud_probability),th=parseFloat(tx.threshold);return(
@@ -658,7 +686,7 @@ export default function App() {
                         <td className="mono amber">{pct(tx.threshold)}</td>
                         <td><span className={`risk-badge ${tx.risk_level}`}>{(tx.risk_level||'').toUpperCase()}</span></td>
                         <td><span className={`decision-badge ${(tx.decision||'').toLowerCase()}`}>{tx.decision}</span></td>
-                        <td><span className={`action-badge ${tx.action==='BLOCK'||tx.action==='BLOCK_AND_BLACKLIST'?'block':tx.action==='FREEZE'?'freeze':tx.action?.includes('WARNING')?'warn':'approve'}`}>{tx.action}</span></td>
+                        <td><span className={`action-badge ${String(tx.action||'').includes('REVIEW')?'warn':tx.action==='BLOCK'||tx.action==='BLOCK_AND_BLACKLIST'?'block':'approve'}`}>{tx.action}</span></td>
                       </tr>
                     )})}
                   </tbody>
@@ -721,8 +749,8 @@ export default function App() {
                 <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:16}}>
                   {[
                     {label:'Total TX',        value:walletTxList.length,                                              color:'#818cf8'},
-                    {label:'Total Sent',      value:`${walletTxList.reduce((s,t)=>s+parseFloat(t.amount||0),0).toFixed(3)} ETH`, color:'#22c55e'},
-                    {label:'Blocked/Frozen',  value:walletTxList.filter(t=>t.action==='BLOCK'||t.action==='BLOCK_AND_BLACKLIST'||t.action==='FREEZE').length, color:'#ef4444'},
+                    {label:'Total Sent',      value:`${approvedWalletTxs.reduce((s,t)=>s+parseFloat(t.amount||0),0).toFixed(3)} ETH`, color:'#22c55e'},
+                    {label:'Review Required',  value:walletTxList.filter(t=>String(t.action||'').includes('REVIEW')||t.action==='BLOCK'||t.action==='BLOCK_AND_BLACKLIST').length, color:'#f59e0b'},
                     {label:'Avg Fraud Score', value:`${(walletTxList.reduce((s,t)=>s+parseFloat(t.fraud_probability||0),0)/walletTxList.length*100).toFixed(1)}%`, color:'#a855f7'},
                   ].map(({label,value,color})=>(
                     <div key={label} style={{background:'#0a0f1e',border:'1px solid #1e1e2e',borderRadius:8,padding:'10px 14px'}}>
@@ -744,7 +772,7 @@ export default function App() {
                             <td className="mono" style={{color:fp>th?'#ef4444':'#22c55e',fontWeight:600}}>{pct(tx.fraud_probability)}</td>
                             <td className="mono amber">{pct(tx.threshold)}</td>
                             <td><span className={`decision-badge ${(tx.decision||'').toLowerCase()}`}>{tx.decision}</span></td>
-                            <td><span className={`action-badge ${tx.action==='BLOCK'||tx.action==='BLOCK_AND_BLACKLIST'?'block':tx.action==='FREEZE'?'freeze':tx.action?.includes('WARNING')?'warn':'approve'}`}>{tx.action}</span></td>
+                            <td><span className={`action-badge ${String(tx.action||'').includes('REVIEW')?'warn':tx.action==='BLOCK'||tx.action==='BLOCK_AND_BLACKLIST'?'block':'approve'}`}>{tx.action}</span></td>
                             <td className="muted small">{tx.timestamp?new Date(tx.timestamp).toLocaleTimeString():'—'}</td>
                           </tr>
                         )
@@ -765,7 +793,7 @@ export default function App() {
                     <span>Amount in ETH</span>
                     <input className="form-input" type="number" min="0.001" step="0.001" value={amount} onChange={e=>setAmount(e.target.value)} placeholder="0.05"/>
                     {amount&&<div className="amount-preview" style={{color:amountRule.color}}>
-                      Rule: <strong>{amountRule.label}</strong> — {amountRule.desc}
+                      History preview: <strong>{amountRule.label}</strong> — {amountRule.desc}
                     </div>}
                   </label>
                 </div>
@@ -789,7 +817,7 @@ export default function App() {
                   ].map(([label,s,r,a])=>(
                     <button key={label} className="scenario-btn" onClick={()=>loadScenario(s,r,a)}>
                       <span>{label}</span>
-                      <span style={{color:getAmountRule(a).color}} className="mono">{a} ETH</span>
+                      <span style={{color:'#7c3aed'}} className="mono">{a} ETH</span>
                     </button>
                   ))}
                 </div>
@@ -805,12 +833,12 @@ export default function App() {
                   {!lastResult
                     ?<div className="empty-result"><div className="empty-hex">⬡</div><p>Submit a transaction to see AI analysis here</p></div>
                     :<>
-                      <div className={`result-banner ${lastResult.action==='FREEZE'?'frozen':lastResult.action?.startsWith('BLOCK')?'blocked':'approved'}`}>
-                        <div className="result-title">{lastResult.action==='FREEZE'?'🧊 FROZEN':lastResult.action?.startsWith('BLOCK')?'🚫 BLOCKED':'✅ APPROVED'}</div>
+                      <div className={`result-banner ${lastResult.action?.includes('REVIEW')?'frozen':'approved'}`}>
+                        <div className="result-title">{lastResult.action?.includes('REVIEW')?'⚠️ REVIEW REQUIRED':'✅ APPROVED'}</div>
                         <div className="result-action">{lastResult.action}</div>
                       </div>
                       <div className="prob-bar-wrap">
-                        <div className="prob-bar-labels"><span>Fraud Probability</span><span style={{color:parseFloat(lastResult.fraud_probability)>parseFloat(lastResult.threshold)?'#ef4444':'#22c55e',fontWeight:700}}>{pct(lastResult.fraud_probability)}</span></div>
+                        <div className="prob-bar-labels"><span>Receiver Risk Score</span><span style={{color:parseFloat(lastResult.fraud_probability)>parseFloat(lastResult.threshold)?'#ef4444':'#22c55e',fontWeight:700}}>{pct(lastResult.fraud_probability)}</span></div>
                         <div className="prob-bar-track">
                           <div className="prob-bar-fill" style={{width:`${Math.min(parseFloat(lastResult.fraud_probability)*100,100)}%`,background:parseFloat(lastResult.fraud_probability)>0.7?'#ef4444':parseFloat(lastResult.fraud_probability)>0.4?'#f59e0b':'#22c55e'}}/>
                           <div className="prob-threshold-marker" style={{left:`${Math.min(parseFloat(lastResult.threshold)*100,100)}%`}}/>
@@ -820,10 +848,11 @@ export default function App() {
                       <div className="result-rows">
                         {[
                           ['Transaction ID',    lastResult.tx_hash,               'accent'],
-                          ['Fraud Probability', pct(lastResult.fraud_probability), parseFloat(lastResult.fraud_probability)>parseFloat(lastResult.threshold)?'red':'green'],
+                          ['Receiver Risk Score', pct(lastResult.fraud_probability), parseFloat(lastResult.fraud_probability)>parseFloat(lastResult.threshold)?'red':'green'],
                           ['Normal Probability',pct(lastResult.normal_probability),'green'],
                           ['Dynamic Threshold', pct(lastResult.threshold),         'amber'],
-                          ['Amount Rule',       lastResult.amount_rule||'SAFE',    lastResult.amount_rule==='BLOCK'?'red':lastResult.amount_rule==='FREEZE'?'amber':'green'],
+                          ['Confirmation',      lastResult.requires_confirmation?'USER CONFIRMATION':'AUTO PROCEED', lastResult.requires_confirmation?'amber':'green'],
+                          ['Confirmation Level',lastResult.confirmation_level||'low', lastResult.confirmation_level==='high'?'red':lastResult.confirmation_level==='medium'?'amber':'green'],
                           ['Risk Level',        (lastResult.risk_level||'').toUpperCase(),'purple'],
                           ['Decision',          lastResult.decision,               lastResult.decision==='FRAUDULENT'||lastResult.decision==='SUSPICIOUS'?'red':'green'],
                           ['Model Used',        'XGBoost (2.97M Ethereum wallets)','muted'],
@@ -873,11 +902,11 @@ export default function App() {
                     <div className="panel-header"><div><p className="eyebrow muted">Explainable AI</p><h2>AI Explanation</h2></div></div>
                     <div className="explanation-header">
                       <div className="exp-tx">Transaction ID: <span className="accent mono">{lastResult.tx_hash}</span></div>
-                      <div className="exp-row"><span className="exp-label">Fraud Probability:</span><span style={{color:parseFloat(lastResult.fraud_probability)>parseFloat(lastResult.threshold)?'#ef4444':'#22c55e',fontWeight:700}}>{pct(lastResult.fraud_probability)}</span></div>
+                      <div className="exp-row"><span className="exp-label">Receiver Risk Score:</span><span style={{color:parseFloat(lastResult.fraud_probability)>parseFloat(lastResult.threshold)?'#ef4444':'#22c55e',fontWeight:700}}>{pct(lastResult.fraud_probability)}</span></div>
                       <div className="exp-row"><span className="exp-label">Dynamic Threshold:</span><span className="amber" style={{fontWeight:700}}>{pct(lastResult.threshold)}</span></div>
                       <div className="exp-row"><span className="exp-label">Decision:</span>
-                        <span className={`exp-decision ${lastResult.action?.startsWith('BLOCK')?'red':lastResult.action==='FREEZE'?'amber':'green'}`}>
-                          {lastResult.action==='FREEZE'?'🧊 FROZEN':lastResult.action?.startsWith('BLOCK')?'🚫 BLOCKED':'✅ APPROVED'}
+                        <span className={`exp-decision ${lastResult.action?.includes('REVIEW')?'amber':'green'}`}>
+                          {lastResult.action?.includes('REVIEW')?'⚠️ REVIEW REQUIRED':'✅ APPROVED'}
                         </span>
                       </div>
                     </div>
@@ -885,7 +914,7 @@ export default function App() {
                     <div className="exp-reasons">
                       {lastResult.explanation.map((r,i)=>(
                         <div key={i} className="exp-reason">
-                          <span className={`exp-check ${lastResult.action?.startsWith('BLOCK')||lastResult.action==='FREEZE'?'red':'green'}`}>{lastResult.action?.startsWith('BLOCK')||lastResult.action==='FREEZE'?'✖':'✔'}</span>
+                          <span className={`exp-check ${lastResult.action?.includes('REVIEW')?'amber':'green'}`}>{lastResult.action?.includes('REVIEW')?'!':'✔'}</span>
                           <span>{r}</span>
                         </div>
                       ))}
@@ -1147,7 +1176,7 @@ export default function App() {
                 <div className="panel-note">{scEvents.length} events (persistent)</div>
               </div>
               {scEvents.length===0
-                ?<div className="empty-result"><p>No events yet. Analyze a transaction in the Freeze or Block range to trigger.</p></div>
+                ?<div className="empty-result"><p>No events yet. Analyze a receiver wallet with medium/high risk to trigger a review.</p></div>
                 :scEvents.map((ev,i)=>(
                   <div key={i} className="sc-event">
                     <div className="sc-fn">{ev.fn||ev.fn}</div>
@@ -1169,19 +1198,16 @@ export default function App() {
               <div className="code-block">
                 <span className="kw">pragma solidity</span> <span className="str">^0.8.19</span>;<br/><br/>
                 <span className="kw">contract</span> <span className="fn">FraudDetection</span> {'{'}<br/>
-                <span style={{marginLeft:16,color:'#475569',fontStyle:'italic'}}>// Amount rules: 0-25 SAFE · 26-50 FREEZE · 50+ BLOCK</span><br/>
-                <span style={{marginLeft:16}}><span className="kw">uint256 public</span> FREEZE_THRESHOLD = <span className="str">26 ether</span>;</span><br/>
-                <span style={{marginLeft:16}}><span className="kw">uint256 public</span> BLOCK_THRESHOLD  = <span className="str">50 ether</span>;</span><br/><br/>
+                <span style={{marginLeft:16,color:'#475569',fontStyle:'italic'}}>// Wallet behavior drives the threshold; no fixed amount bands</span><br/>
+                <span style={{marginLeft:16}}><span className="kw">uint256 public</span> dynamicThreshold = <span className="str">0</span>;</span><br/><br/>
                 <span style={{marginLeft:16}}><span className="kw">function</span> <span className="fn">logTransaction</span>(</span><br/>
                 <span style={{marginLeft:32,color:'#64748b'}}>string txHash, address sender,</span><br/>
                 <span style={{marginLeft:32,color:'#64748b'}}>uint256 amountWei, uint256 fraudScore, string decision</span><br/>
                 <span style={{marginLeft:16}}>) <span className="kw">public onlyOwner</span> {'{'}</span><br/>
-                <span style={{marginLeft:32}}><span className="kw">if</span>(amountWei {'>'} BLOCK_THRESHOLD) {'{'}</span><br/>
-                <span style={{marginLeft:48}} className="fn">blockTransaction(sender);</span><br/>
-                <span style={{marginLeft:32}}>{'}'} <span className="kw">else if</span>(amountWei {'>'} FREEZE_THRESHOLD) {'{'}</span><br/>
-                <span style={{marginLeft:48}} className="fn">freezeTransaction(sender);</span><br/>
-                <span style={{marginLeft:32}}>{'}'} <span className="kw">else if</span>(fraudScore {'>'} dynamicThreshold) {'{'}</span><br/>
-                <span style={{marginLeft:48}} className="fn">blockTransaction(sender);</span><br/>
+                <span style={{marginLeft:32}}><span className="kw">if</span>(fraudScore {'>'} dynamicThreshold) {'{'}</span><br/>
+                <span style={{marginLeft:48}} className="fn">reviewTransaction(sender);</span><br/>
+                <span style={{marginLeft:32}}>{'}'} <span className="kw">else</span> {'{'}</span><br/>
+                <span style={{marginLeft:48}} className="fn">approveTransaction(sender);</span><br/>
                 <span style={{marginLeft:32}}>{'}'}</span><br/>
                 <span style={{marginLeft:32}}><span className="kw">emit</span> <span className="fn">TransactionLogged</span>(sender, decision, fraudScore);</span><br/>
                 <span style={{marginLeft:16}}>{'}'}</span><br/>
@@ -1221,7 +1247,7 @@ export default function App() {
                 </div>
               </div>
               {alerts.length===0
-                ?<div className="empty-result"><div className="empty-hex">🛡</div><p>No alerts yet. Try "Freeze zone" (35 ETH) or "Auto-block" (75 ETH) in Analyze tab.</p></div>
+                ?<div className="empty-result"><div className="empty-hex">🛡</div><p>No alerts yet. Try a receiver wallet with risky history in the Analyze tab.</p></div>
                 :alerts.map((a,i)=>(
                   <div key={i} className={`alert-item ${a.type==='warn'?'alert-warn':''}`}>
                     <div style={{display:'flex',alignItems:'center',gap:10}}>
@@ -1337,7 +1363,7 @@ export default function App() {
                 {ev:`Flask API running — ${API}`,ok:true},
                 {ev:'XGBoost — Ethereum Phishing Dataset (2.97M nodes)',ok:true},
                 {ev:'SQLite — transactions, alerts, events all persisted',ok:true},
-                {ev:'Amount rules: 0–25 SAFE · 26–50 FREEZE · 50+ BLOCK',ok:true},
+                {ev:'History-driven review replaces fixed amount rules',ok:true},
                 {ev:'Dynamic threshold engine — per-wallet adaptation',ok:true},
                 {ev:`Blockchain — Ganache ${chainLive?'connected port 7545':'offline'}`,ok:chainLive},
                 {ev:`MetaMask ${connStatus==='connected'?'connected: '+compactAddr:'not connected'}`,ok:connStatus==='connected'},
@@ -1352,6 +1378,165 @@ export default function App() {
             </section>
           </div>
         )}
+      {pendingTx&&(
+        <div className="confirmation-overlay" style={{position:'fixed',inset:0,background:'rgba(2,6,23,.72)',backdropFilter:'blur(10px)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:9999,padding:24}}>
+          <div style={{width:'min(1180px,100%)',maxHeight:'95vh',overflowY:'auto',background:'#0b1020',border:'1px solid #334155',borderRadius:22,boxShadow:'0 24px 80px rgba(0,0,0,.45)',padding:24}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:16,marginBottom:18}}>
+              <div>
+                <div style={{fontSize:12,color:'#f59e0b',textTransform:'uppercase',letterSpacing:1}}>Receiver Review</div>
+                <h2 style={{margin:'6px 0 0',fontSize:24,color:'#fff'}}>Confirm this transaction?</h2>
+                <div style={{marginTop:8,color:'#cbd5e1',fontSize:14}}>
+                  Review the receiver risk, threshold, and blockchain details before sending the transfer on-chain.
+                </div>
+              </div>
+              <button className="export-btn" onClick={()=>confirmPendingTransaction(false)} disabled={sending}>Cancel</button>
+            </div>
+            <div style={{marginTop:18,display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(230px,1fr))',gap:12}}>
+              <div style={{padding:14,background:'#111827',border:'1px solid #1f2937',borderRadius:14}}>
+                <div style={{fontSize:11,color:'#94a3b8',textTransform:'uppercase',letterSpacing:.8}}>Status</div>
+                <div style={{marginTop:6,fontSize:18,fontWeight:700,color:'#f59e0b'}}>{confirmationResult?.action?.includes('REVIEW') ? 'REVIEW REQUIRED' : 'APPROVED'}</div>
+              </div>
+              <div style={{padding:14,background:'#111827',border:'1px solid #1f2937',borderRadius:14}}>
+                <div style={{fontSize:11,color:'#94a3b8',textTransform:'uppercase',letterSpacing:.8}}>Receiver Risk Score</div>
+                <div style={{marginTop:6,fontSize:18,fontWeight:700,color:'#fff'}}>{confirmationResult ? pct(confirmationResult.fraud_probability) : '—'}</div>
+              </div>
+              <div style={{padding:14,background:'#111827',border:'1px solid #1f2937',borderRadius:14}}>
+                <div style={{fontSize:11,color:'#94a3b8',textTransform:'uppercase',letterSpacing:.8}}>Dynamic Threshold</div>
+                <div style={{marginTop:6,fontSize:18,fontWeight:700,color:'#fff'}}>{confirmationResult ? pct(confirmationResult.threshold) : '—'}</div>
+              </div>
+              <div style={{padding:14,background:'#111827',border:'1px solid #1f2937',borderRadius:14}}>
+                <div style={{fontSize:11,color:'#94a3b8',textTransform:'uppercase',letterSpacing:.8}}>Confirmation Level</div>
+                <div style={{marginTop:6,fontSize:18,fontWeight:700,color:'#fff'}}>{(confirmationResult?.confirmation_level||'high').toUpperCase()}</div>
+              </div>
+            </div>
+
+            <div style={{display:'grid',gridTemplateColumns:'1.2fr .8fr',gap:16,marginTop:18}}>
+              <div style={{background:'#0f172a',border:'1px solid #334155',borderRadius:16,padding:16}}>
+                <h3 style={{margin:'0 0 12px',color:'#fff',fontSize:16}}>Fraud Detection Output</h3>
+                <table style={{width:'100%',borderCollapse:'collapse',color:'#e2e8f0',fontSize:13}}>
+                  <tbody>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Transaction ID</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult?.tx_hash || pendingTx.tx_hash || '—'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Receiver Risk Score</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult ? pct(confirmationResult.fraud_probability) : '—'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Normal Probability</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult ? pct(confirmationResult.normal_probability) : '—'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Dynamic Threshold</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult ? pct(confirmationResult.threshold) : '—'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Decision</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right',color:'#f59e0b'}}>{confirmationResult?.decision || '—'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Risk Level</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{(confirmationResult?.risk_level||'').toUpperCase() || '—'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Model Used</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult?.model_used || 'XGBoost (2.97M Ethereum wallets)'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Block Number</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult?.block_number || 'Pending'}</td></tr>
+                    <tr><td style={{padding:'8px 0',color:'#94a3b8'}}>Blockchain Hash</td><td style={{padding:'8px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult?.blockchain_hash || 'Simulated'}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{background:'#0f172a',border:'1px solid #334155',borderRadius:16,padding:16}}>
+                <h3 style={{margin:'0 0 12px',color:'#fff',fontSize:16}}>Transaction Review</h3>
+                <div style={{display:'grid',gap:10,color:'#e2e8f0',fontSize:13}}>
+                  <div style={{padding:12,background:'#111827',borderRadius:12}}>Confirmation: {confirmationResult?.requires_confirmation ? 'USER CONFIRMATION' : 'AUTO PROCEED'}</div>
+                  <div style={{padding:12,background:'#111827',borderRadius:12}}>Confirmation Level: {(confirmationResult?.confirmation_level || 'high').toUpperCase()}</div>
+                  <div style={{padding:12,background:'#111827',borderRadius:12}}>Amount: {pendingTx.amount} ETH</div>
+                  <div style={{padding:12,background:'#111827',borderRadius:12}}>Sender: {short(pendingTx.sender)}</div>
+                  <div style={{padding:12,background:'#111827',borderRadius:12}}>Receiver: {short(pendingTx.receiver)}</div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginTop:16}}>
+              <div style={{background:'#0f172a',border:'1px solid #334155',borderRadius:16,padding:16}}>
+                <h3 style={{margin:'0 0 12px',color:'#fff',fontSize:16}}>Receiver Wallet Analysis</h3>
+                {receiverRisk ? (
+                  <table style={{width:'100%',borderCollapse:'collapse',color:'#e2e8f0',fontSize:13}}>
+                    <tbody>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Receiver Address</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{short(receiverRisk.address)}</td></tr>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Receiver Fraud Score</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{pct(receiverRisk.fraud_score)}</td></tr>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Receiver Risk Level</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{(receiverRisk.risk_level||'').toUpperCase() || '—'}</td></tr>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Known TX Count</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{receiverRisk.tx_count}</td></tr>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Unique Senders</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{receiverRisk.recv_unique}</td></tr>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>High Fan-out</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{receiverRisk.high_fan_out ? 'YES — Suspicious' : 'No'}</td></tr>
+                      <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Only Receives</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{receiverRisk.zero_recv ? 'Yes — Suspicious' : 'No'}</td></tr>
+                    </tbody>
+                  </table>
+                ) : (
+                  <div style={{color:'#94a3b8'}}>Receiver analysis is not available yet.</div>
+                )}
+              </div>
+
+              <div style={{background:'#0f172a',border:'1px solid #334155',borderRadius:16,padding:16}}>
+                <h3 style={{margin:'0 0 12px',color:'#fff',fontSize:16}}>Dynamic Threshold Evolution</h3>
+                {confirmationHistory.length ? (
+                  <>
+                    <div style={{height:220,marginBottom:12}}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={confirmationHistory.slice().reverse()}>
+                          <XAxis dataKey="tx" tick={{fill:'#64748b',fontSize:11}} axisLine={false} tickLine={false} />
+                          <YAxis tick={{fill:'#64748b',fontSize:11}} axisLine={false} tickLine={false} domain={[0,100]} />
+                          <Tooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,color:'#e2e8f0'}} />
+                          <Area type="monotone" dataKey="score" stroke="#f87171" fill="url(#thresholdFillPopup)" strokeWidth={2} dot={{r:3}} />
+                          <Area type="monotone" dataKey="threshold" stroke="#f59e0b" fill="transparent" strokeDasharray="5 5" strokeWidth={2} dot={{r:3}} />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div style={{display:'grid',gap:10}}>
+                      {confirmationHistory.map((item, idx) => (
+                        <div key={`${item.tx}-${idx}`} style={{padding:12,background:'#111827',borderRadius:12,border:'1px solid #1f2937'}}>
+                          <div style={{display:'flex',justifyContent:'space-between',gap:12,color:'#e2e8f0',fontSize:13}}>
+                            <span style={{fontFamily:'monospace'}}>{item.tx}</span>
+                            <span style={{color:'#94a3b8'}}>{item.time}</span>
+                          </div>
+                          <div style={{marginTop:8,display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,fontSize:12,color:'#cbd5e1'}}>
+                            <div>Fraud: {item.score}%</div>
+                            <div>Threshold: {item.threshold}%</div>
+                            <div>Amount: {fmtEth(item.amount)} ETH</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{color:'#94a3b8'}}>No threshold history preview available yet.</div>
+                )}
+              </div>
+            </div>
+
+            {confirmationResult?.explanation?.length ? (
+              <div style={{marginTop:16,background:'#0f172a',border:'1px solid #334155',borderRadius:16,padding:16}}>
+                <h3 style={{margin:'0 0 12px',color:'#fff',fontSize:16}}>AI Explanation</h3>
+                <ul style={{margin:0,paddingLeft:18,color:'#e2e8f0',lineHeight:1.6}}>
+                  {confirmationResult.explanation.map((reason, idx) => <li key={idx}>{reason}</li>)}
+                </ul>
+              </div>
+            ) : null}
+
+            <div style={{marginTop:16,background:'#0f172a',border:'1px solid #334155',borderRadius:16,padding:16}}>
+              <h3 style={{margin:'0 0 12px',color:'#fff',fontSize:16}}>Analysis Summary</h3>
+              <table style={{width:'100%',borderCollapse:'collapse',color:'#e2e8f0',fontSize:13}}>
+                <tbody>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Transaction ID</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult?.tx_hash || pendingTx.tx_hash || '—'}</td></tr>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Sender Address</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{short(pendingTx.sender)}</td></tr>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Receiver Address</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{short(pendingTx.receiver)}</td></tr>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Receiver Risk Score</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult ? pct(confirmationResult.fraud_probability) : '—'}</td></tr>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Dynamic Threshold</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult ? pct(confirmationResult.threshold) : '—'}</td></tr>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Decision</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right',color:'#f59e0b'}}>{confirmationResult?.decision || '—'}</td></tr>
+                  <tr><td style={{padding:'7px 0',color:'#94a3b8'}}>Confirmation</td><td style={{padding:'7px 0',fontFamily:'monospace',textAlign:'right'}}>{confirmationResult?.requires_confirmation ? 'USER CONFIRMATION' : 'AUTO PROCEED'}</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <svg width="0" height="0" style={{position:'absolute'}} aria-hidden="true">
+              <defs>
+                <linearGradient id="thresholdFillPopup" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#f87171" stopOpacity={0.35}/>
+                  <stop offset="95%" stopColor="#f87171" stopOpacity={0.03}/>
+                </linearGradient>
+              </defs>
+            </svg>
+
+            <div style={{display:'flex',gap:12,justifyContent:'flex-end',marginTop:24}}>
+              <button className="scenario-btn" onClick={()=>confirmPendingTransaction(false)} disabled={sending}>Cancel transaction</button>
+              <button className="primary-button" onClick={()=>confirmPendingTransaction(true)} disabled={sending}>{sending?'Completing...':'Yes, proceed'}</button>
+            </div>
+          </div>
+        </div>
+      )}
       </main>
     </div>
   )
