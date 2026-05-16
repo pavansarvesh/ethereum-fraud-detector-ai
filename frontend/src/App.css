@@ -112,130 +112,24 @@ body {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 14px;
-}
-
-/* ── WALLET BADGE (REDESIGNED) ── */
-.wallet-badge {
-  display: flex;
-  align-items: center;
   gap: 10px;
-  background: linear-gradient(135deg, rgba(124, 58, 237, 0.08) 0%, rgba(109, 40, 217, 0.05) 100%);
-  border: 1px solid rgba(124, 58, 237, 0.2);
-  border-radius: 12px;
-  padding: 8px 14px;
-  backdrop-filter: blur(8px);
-  transition: all .3s cubic-bezier(0.23, 1, 0.320, 1);
-  cursor: default;
 }
 
-.wallet-badge:hover {
-  border-color: rgba(124, 58, 237, 0.4);
-  background: linear-gradient(135deg, rgba(124, 58, 237, 0.12) 0%, rgba(109, 40, 217, 0.08) 100%);
-  box-shadow: 0 0 20px rgba(124, 58, 237, 0.15);
-}
-
-.wallet-badge-net {
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: #c084fc;
-  padding: 3px 8px;
-  background: rgba(168, 85, 247, 0.15);
-  border-radius: 5px;
-  border: 1px solid rgba(168, 85, 247, 0.3);
-}
-
-.wallet-badge-main {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.wallet-badge-amount {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  font-weight: 800;
-  letter-spacing: -0.4px;
-}
-
-.wallet-badge-amount .amt {
-  font-size: 15px;
-  color: #fff;
-  background: linear-gradient(135deg, #fbbf24, #f59e0b);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-.wallet-badge-amount .sym {
-  font-size: 12px;
-  color: #f59e0b;
-  font-weight: 900;
-  margin-top: 2px;
-}
-
-.wallet-badge-addr {
-  font-size: 8px;
-  color: #94a3b8;
-  font-family: 'Monaco', 'Courier New', monospace;
-  letter-spacing: 0.3px;
-  font-weight: 600;
-}
-
-.wallet-connect-btn {
-  background: linear-gradient(135deg, #a78bfa 0%, #8b5cf6 100%);
-  border: 1px solid rgba(168, 85, 247, 0.8);
-  border-radius: 8px;
-  padding: 8px 14px;
-  font-size: 11px;
-  font-weight: 700;
-  color: #fff;
-  cursor: pointer;
-  transition: all .3s ease;
-  letter-spacing: 0.5px;
-  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.2);
-}
-
-.wallet-connect-btn:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 16px rgba(124, 58, 237, 0.35);
-  border-color: rgba(236, 72, 153, 0.9);
-  background: linear-gradient(135deg, #c084fc 0%, #a78bfa 100%);
-}
-
-.status-pulse {
+.net-badge {
   display: flex;
   align-items: center;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  transition: all .3s ease;
+  gap: 6px;
+  font-size: 11px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  border: 1px solid #22c55e40;
+  color: var(--green);
+  background: #22c55e10;
 }
 
-.status-pulse.live .pulse-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #22c55e;
-  box-shadow: 0 0 8px #22c55e, inset 0 0 3px rgba(255, 255, 255, 0.3);
-  animation: pulse-glow 2s ease-in-out infinite;
-}
-
-@keyframes pulse-glow {
-
-  0%,
-  100% {
-    box-shadow: 0 0 8px #22c55e, inset 0 0 3px rgba(255, 255, 255, 0.3);
-    transform: scale(1);
-  }
-
-  50% {
-    box-shadow: 0 0 14px #22c55e, inset 0 0 4px rgba(255, 255, 255, 0.4);
-    transform: scale(1.1);
-  }
+.connected-dot {
+  background: var(--green) !important;
+  box-shadow: 0 0 6px var(--green);
 }
 
 /* ── MAIN ── */

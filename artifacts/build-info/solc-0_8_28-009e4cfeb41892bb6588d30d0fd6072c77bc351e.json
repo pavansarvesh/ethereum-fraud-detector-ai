@@ -1,8 +1,8 @@
 {
   "_format": "hh3-sol-build-info-1",
-  "id": "solc-0_8_19-90791c43807bc49ceb2f69105ed2d5b6382c1496",
-  "solcVersion": "0.8.19",
-  "solcLongVersion": "0.8.19+commit.7dd6d404",
+  "id": "solc-0_8_28-009e4cfeb41892bb6588d30d0fd6072c77bc351e",
+  "solcVersion": "0.8.28",
+  "solcLongVersion": "0.8.28+commit.7893614a",
   "compilerType": "solc",
   "userSourceNameMap": {
     "contracts/FraudDetection.sol": "project/contracts/FraudDetection.sol"
@@ -10,7 +10,7 @@
   "input": {
     "language": "Solidity",
     "settings": {
-      "evmVersion": "paris",
+      "evmVersion": "cancun",
       "outputSelection": {
         "*": {
           "": [

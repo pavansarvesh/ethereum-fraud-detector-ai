@@ -17,8 +17,9 @@ except ImportError:
     WEB3_AVAILABLE = False
 
 BLOCKCHAIN_RPC    = os.getenv("BLOCKCHAIN_RPC",    "http://127.0.0.1:7545")
-CONTRACT_ADDRESS  = os.getenv("CONTRACT_ADDRESS",  "")
-ADMIN_PRIVATE_KEY = os.getenv("ADMIN_PRIVATE_KEY", "")
+CONTRACT_ADDRESS   = os.getenv("CONTRACT_ADDRESS",  "")
+ADMIN_PRIVATE_KEY  = os.getenv("ADMIN_PRIVATE_KEY", "")
+GANACHE_PRIVATE_KEY = os.getenv("GANACHE_PRIVATE_KEY", "")
 
 _w3       = None
 _contract = None
@@ -427,3 +428,102 @@ def verify_transaction_receipt(tx_hash: str) -> dict:
     return {"verified":False,"tx_hash":tx_hash,
             "message":"Transaction is simulated (deploy contract to Ganache for real verification)",
             "confirmations":0,"status":"SIMULATED"}
+
+
+
+def execute_eth_transfer(sender: str, receiver: str, amount_eth: float) -> dict:
+    """
+    Execute a real ETH transfer on Ganache.
+    If ADMIN_PRIVATE_KEY is set, it must match the sender account.
+    Otherwise, Ganache must expose the sender as an unlocked account.
+    """
+    w3 = get_web3()
+    if not w3 or not w3.is_connected():
+        return {"success": False, "error": "Blockchain not connected"}
+
+    try:
+        receiver_addr = Web3.to_checksum_address(receiver) if len(str(receiver)) == 42 else None
+        if not receiver_addr:
+            return {"success": False, "error": "Invalid receiver address", "sender": sender, "receiver": receiver}
+
+        amount_wei = w3.to_wei(float(amount_eth), "ether")
+
+        signing_key = None
+        if GANACHE_PRIVATE_KEY and len(GANACHE_PRIVATE_KEY) == 66:
+            signing_key = GANACHE_PRIVATE_KEY
+        elif ADMIN_PRIVATE_KEY and len(ADMIN_PRIVATE_KEY) == 66:
+            signing_key = ADMIN_PRIVATE_KEY
+
+        if signing_key:
+            signer = w3.eth.account.from_key(signing_key)
+            sender_addr = signer.address
+            if sender and len(str(sender)) == 42:
+                requested_sender = Web3.to_checksum_address(sender)
+                if requested_sender.lower() != sender_addr.lower():
+                    return {
+                        "success": False,
+                        "error": "Sender address does not match the configured signing key",
+                        "sender": requested_sender,
+                        "expected_sender": sender_addr,
+                        "receiver": receiver_addr,
+                        "amount_eth": float(amount_eth),
+                    }
+        else:
+            if not sender or len(str(sender)) != 42:
+                return {"success": False, "error": "Sender address required for unlocked account transfer", "sender": sender, "receiver": receiver_addr}
+            sender_addr = Web3.to_checksum_address(sender)
+
+        balance_wei = w3.eth.get_balance(sender_addr)
+        if balance_wei < amount_wei:
+            return {
+                "success": False,
+                "error": f"Insufficient balance. Have {float(w3.from_wei(balance_wei, 'ether')):.4f} ETH, need {float(amount_eth):.4f} ETH",
+                "sender": sender_addr,
+                "receiver": receiver_addr,
+                "balance": float(w3.from_wei(balance_wei, "ether")),
+                "amount_eth": float(amount_eth),
+            }
+
+        nonce = w3.eth.get_transaction_count(sender_addr)
+        tx = {
+            "from": sender_addr,
+            "to": receiver_addr,
+            "value": amount_wei,
+            "nonce": nonce,
+            "gas": 21000,
+            "gasPrice": w3.eth.gas_price,
+        }
+
+        if signing_key:
+            signed = w3.eth.account.sign_transaction(tx, signing_key)
+            raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        else:
+            tx_hash = w3.eth.send_transaction(tx)
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        sender_balance_after = w3.eth.get_balance(sender_addr)
+        receiver_balance_after = w3.eth.get_balance(receiver_addr)
+
+        return {
+            "success": True,
+            "tx_hash": tx_hash.hex(),
+            "block_number": receipt.blockNumber,
+            "gas_used": receipt.gasUsed,
+            "status": "SUCCESS" if receipt.status == 1 else "FAILED",
+            "sender": sender_addr,
+            "receiver": receiver_addr,
+            "amount_eth": float(amount_eth),
+            "sender_balance_before": float(w3.from_wei(balance_wei, "ether")),
+            "sender_balance_after": float(w3.from_wei(sender_balance_after, "ether")),
+            "receiver_balance_after": float(w3.from_wei(receiver_balance_after, "ether")),
+        }
+    except Exception as e:
+        print(f"[BLOCKCHAIN] ETH transfer error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "sender": sender,
+            "receiver": receiver,
+            "amount_eth": amount_eth,
+        }

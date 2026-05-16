@@ -517,16 +517,19 @@ export default function App() {
           ))}
         </div>
         <div className="nav-right">
+          <span className={`net-badge ${chainLive?'live':''}`}><span className="status-dot connected-dot"/>{chainLive?'Blockchain Live':'Offline'}</span>
           {walletAddr
-            ?<div className="wallet-badge">
-                <div className="wallet-badge-net">{network}</div>
-                <div className="wallet-badge-main">
-                  <div className="wallet-badge-amount"><span className="amt">{balance}</span><span className="sym">Ξ</span></div>
-                  <div className="wallet-badge-addr">{compactAddr}</div>
-                </div>
+            ?<div className="wallet-info-pill">
+                <span className="wallet-network">{network}</span>
+                <span className="wallet-bal">
+                  {balance} ETH
+                  {balanceDiff&&<span className={`bal-diff ${parseFloat(balanceDiff)>0?'pos':'neg'}`}>
+                    {parseFloat(balanceDiff)>0?'+':''}{balanceDiff}
+                  </span>}
+                </span>
+                <span className="wallet-addr">{compactAddr}</span>
               </div>
-            :<span className="wallet-connect-btn" onClick={handleConnect}>Connect Wallet</span>}
-          <span className={`status-pulse ${chainLive?'live':''}`}><span className="pulse-dot"/></span>
+            :<span className="address-chip-nav" onClick={handleConnect}>Connect Wallet</span>}
         </div>
       </nav>
 

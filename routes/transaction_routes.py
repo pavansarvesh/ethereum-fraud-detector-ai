@@ -21,7 +21,8 @@ from blockchain.connect        import (log_transaction_on_chain,
                                        verify_transaction_receipt,
                                        anchor_threshold_on_chain,
                                        get_threshold_history_from_chain,
-                                       verify_model_integrity)
+                                       verify_model_integrity,
+                                       execute_eth_transfer)
 from database.db               import (
     save_transaction, get_sender_history, get_receiver_history,
     get_all_transactions, get_dashboard_stats,
@@ -61,7 +62,7 @@ def analyze_transaction():
 
     # ── Feature engineering ────────────────────────────────────────────────────
     sender_history   = get_sender_history(sender, limit=200)
-    receiver_history = get_receiver_history(sender, limit=200)
+    receiver_history = get_receiver_history(receiver, limit=200)
     features         = engineer_features(
         {'amount': amount, 'receiver': receiver, 'timestamp': timestamp},
         sender_history, receiver_history
@@ -86,6 +87,15 @@ def analyze_transaction():
     explanation = generate_ai_explanation(
         features, fraud_prob, threshold, decision, thresh_data, amount
     )
+
+    # ── Execute ETH transfer if approved ──────────────────────────────────────
+    transfer_result = {'success': False, 'simulated': True}
+    if not check_only and action in ('APPROVE', 'APPROVE_WITH_WARNING'):
+        transfer_result = execute_eth_transfer(sender, receiver, amount)
+        if not transfer_result.get('success'):
+            action = 'BLOCK'
+            decision = 'FRAUDULENT'
+            explanation.insert(0, f"Transfer execution failed: {transfer_result.get('error', 'Unknown error')}")
 
     # ── Blockchain log (skip for check_only) ───────────────────────────────────
     bc = {'blockchain_hash': '', 'block_number': 0, 'simulated': True}
@@ -117,10 +127,10 @@ def analyze_transaction():
         'risk_level'       : risk_level,
         'decision'         : decision,
         'action'           : action,
-        'blockchain_hash'  : bc.get('blockchain_hash', ''),
-        'block_number'     : bc.get('block_number', 0),
-        'gas_used'         : bc.get('gas_used', 0),
-        'failed'           : 1 if action in ('BLOCK','BLOCK_AND_BLACKLIST','FREEZE') else 0,
+        'blockchain_hash'  : transfer_result.get('tx_hash', bc.get('blockchain_hash', '')) if transfer_result.get('success') else bc.get('blockchain_hash', ''),
+        'block_number'     : transfer_result.get('block_number', bc.get('block_number', 0)) if transfer_result.get('success') else bc.get('block_number', 0),
+        'gas_used'         : transfer_result.get('gas_used', bc.get('gas_used', 0)) if transfer_result.get('success') else bc.get('gas_used', 0),
+        'failed'           : 1 if action in ('BLOCK','BLOCK_AND_BLACKLIST','FREEZE') or not transfer_result.get('success') and action in ('APPROVE','APPROVE_WITH_WARNING') else 0,
     }
     if not check_only:
         save_transaction(tx_record)
@@ -135,7 +145,10 @@ def analyze_transaction():
         'threshold_reason'    : thresh_data.get('reason', ''),
         'amount_rule'         : amount_rule,
         'explanation'         : explanation,
-        'blockchain_simulated': bc.get('simulated', True),
+        'blockchain_simulated': bc.get('simulated', True) and not transfer_result.get('success', False),
+        'transfer_executed'   : transfer_result.get('success', False),
+        'transfer_result'     : transfer_result,
+        'contract_log_hash'   : bc.get('blockchain_hash', ''),
         'features'            : {k: v for k, v in features.items() if k != 'receiver'},
         'timestamp'           : datetime.now().isoformat(),
     }), 200
