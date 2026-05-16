@@ -1,0 +1,7 @@
+{
+  "network": "ganache",
+  "contract": "FraudDetection",
+  "address": "0xC761851865a46e15fee36A011395F120cB4e1533",
+  "deployedBy": "0x092C0aDc27E689edA8dcB0733b012E980A2b9B7b",
+  "timestamp": "2026-05-16T08:29:12.788Z"
+}

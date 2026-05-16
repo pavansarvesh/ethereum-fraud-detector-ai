@@ -6,7 +6,10 @@ export default defineConfig({
 	plugins: [hardhatEthers],
 
 	solidity: {
-		version: "0.8.28",
+		version: "0.8.20",
+		settings: {
+			evmVersion: "paris",
+		},
 	},
 
 	networks: {
